@@ -1,7 +1,7 @@
 {
   "name": "dsh-budget-tracker",
-  "version": "0.1.0",
-  "description": "Minimal DeepSeek Harness budget tracker that exposes only context_remaining.",
+  "version": "0.2.0",
+  "description": "DeepSeek Harness budget tracker exposing remaining pressure budget before proactive compaction.",
   "type": "module",
   "main": "index.js",
   "files": [
@@ -17,6 +17,7 @@
     "deepseek",
     "deepseek-harness",
     "agent",
+    "compaction",
     "context-window",
     "budget-tracker"
   ],
