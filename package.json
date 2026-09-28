@@ -1,0 +1,32 @@
+{
+  "name": "dsh-budget-tracker",
+  "version": "0.1.0",
+  "description": "Minimal DeepSeek Harness budget tracker that exposes only context_remaining.",
+  "type": "module",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "agent",
+    "context-window",
+    "budget-tracker"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
