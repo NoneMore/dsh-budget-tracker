@@ -36,9 +36,11 @@ compaction_threshold_tokens
 floor(min(W * R, W - O - B))
 ```
 
-The tracker reproduces that formula using the active compaction service's resolved policy, including exact provider/model overrides.
+The tracker reproduces that formula using the active compaction service's resolved pressure policy, including exact provider/model overrides.
 
-For the current pressure numerator it deliberately uses:
+For the routed model capacity it resolves the current model metadata through Harness, matching the capacity source used by `dsh-compaction-basic`. For the completion reservation it uses the latest durable request header and falls back to the adapter's current default when that header declares no cap.
+
+For the pressure numerator it deliberately uses:
 
 ```js
 ctx.tokenMeter.measure(session).totalTokens
@@ -61,26 +63,30 @@ context_remaining         =   190,000
 
 ## Timing semantics
 
-The value follows the **latest durable routed request**, which is also what `dsh-compaction-basic` evaluates at the next `agent/pre-step` pressure check.
+The value follows the **latest durable routed provider/model**, which is also the route `dsh-compaction-basic` evaluates at the next `agent/pre-step` pressure check.
+
+The tracker installs a prepended `agent/pre-step` wrapper and computes only after `next()` returns. This means any downstream pruning or proactive compaction has already completed before `context_remaining` is measured and injected into the request. A step that compacts therefore sees the **post-compaction** remaining budget, not the stale value that triggered compaction.
 
 The first request of a fresh session has no prior durable route, so the plugin emits nothing. It also emits nothing when:
 
 - automatic compaction is disabled with `auto: false`;
 - no routed context capacity is available;
-- the durable request header and request context disagree;
+- routed model metadata cannot be resolved;
 - the resolved pressure budget is invalid.
 
 It does not fall back to the model's absolute context-window remainder, because that would give the same field two different meanings.
 
 ## Dynamic context
 
-The value is contributed through `systemPrompt.context(...)`, so Harness treats it as dynamic runtime context rather than rewriting the stable system-prompt prefix.
+The value is added as a source-attributed snapshot context message after the pre-step chain settles. If the same retained value is already present, the plugin does not add a duplicate snapshot.
 
 The model-visible text remains exactly one field:
 
 ```text
 context_remaining: <tokens>
 ```
+
+This plugin intentionally targets `dsh-compaction-basic` and expects the active `compaction` service to expose its resolved pressure-policy configuration.
 
 ## Install from a local checkout
 
@@ -101,10 +107,10 @@ dsh --profile <profile> --dump-config
 After the repository is public (or when your Git credentials allow access to the private repository):
 
 ```sh
-dsh plugin --profile <profile> add github:<owner>/dsh-budget-tracker
+dsh plugin --profile <profile> add github:NoneMore/dsh-budget-tracker
 ```
 
-This package is plain JavaScript and has no build/prepare step.
+This package is plain JavaScript, has no runtime dependencies, and has no build/prepare step.
 
 ## Test
 
