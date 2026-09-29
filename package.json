@@ -1,6 +1,6 @@
 {
   "name": "dsh-budget-tracker",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "DeepSeek Harness budget tracker exposing remaining pressure budget before proactive compaction.",
   "type": "module",
   "main": "index.js",
@@ -25,6 +25,14 @@
   "engines": {
     "node": ">=20"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NoneMore/dsh-budget-tracker.git"
+  },
+  "bugs": {
+    "url": "https://github.com/NoneMore/dsh-budget-tracker/issues"
+  },
+  "homepage": "https://github.com/NoneMore/dsh-budget-tracker#readme",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
