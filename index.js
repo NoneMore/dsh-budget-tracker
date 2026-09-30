@@ -6,7 +6,7 @@ export const name = 'dsh-budget-tracker'
 // the active compaction service for its resolved policy, the LLM service for
 // the current routed model capacity, and tokenMeter for the exact pressure
 // quantity used by compaction-basic.
-export const inject = ['agents', 'llm', 'tokenMeter', 'compaction']
+export const inject = ['agents']
 
 /**
  * Resolve the pressure fields that dsh-compaction-basic applies to one routed
@@ -131,8 +131,13 @@ function retainedBudgetText(session) {
 }
 
 /** Resolve the model-visible remaining budget after downstream pre-step work. */
-async function contextRemainingText(ctx, agent, signal) {
-  const config = ctx.compaction?.config
+async function contextRemainingText(agent, signal) {
+  const agentCtx = agent?.ctx
+  if (!agentCtx) return undefined
+
+  // Web presets publish compaction inside the agent's isolated preset scope,
+  // so resolve runtime services from the agent context rather than the host.
+  const config = agentCtx.compaction?.config
   const header = agent.session.requestHeader()
   if (!header) return undefined
 
@@ -146,7 +151,7 @@ async function contextRemainingText(ctx, agent, signal) {
 
   let info
   try {
-    info = await ctx.llm.resolveModelInfo(provider, model, signal)
+    info = await agentCtx.llm.resolveModelInfo(provider, model, signal)
   } catch {
     return undefined
   }
@@ -165,7 +170,7 @@ async function contextRemainingText(ctx, agent, signal) {
   // Deliberately totalTokens, not projectedTokens: this is the same numerator
   // dsh-compaction-basic checks. Running after next() means compaction/pruning
   // performed by downstream pre-step listeners is already reflected here.
-  const currentPressureTokens = ctx.tokenMeter.measure(agent.session).totalTokens
+  const currentPressureTokens = agentCtx.tokenMeter.measure(agent.session).totalTokens
   const remaining = calculateContextRemaining(thresholdTokens, currentPressureTokens)
   return remaining === undefined ? undefined : `context_remaining: ${remaining}`
 }
@@ -185,7 +190,7 @@ export function apply(ctx) {
     const decision = await next()
     if (decision.kind === 'reject' || signal?.aborted) return decision
 
-    const text = await contextRemainingText(ctx, agent, signal)
+    const text = await contextRemainingText(agent, signal)
     if (text === undefined || signal?.aborted) return decision
     if (retainedBudgetText(agent.session) === text) return decision
 
