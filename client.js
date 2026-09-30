@@ -8,6 +8,7 @@ window.__ModuleLoader__.load({
     const NS = 'budgetTracker'
     const ROW_KEY = 'dsh-budget-tracker#budget-tracker'
     const DEFAULT_MODE = 'semantic'
+    const TITLE_ID = 'dsh-budget-tracker-prompt-mode-title'
     const MODES = ['none', 'semantic', 'planning', 'behavioral']
 
     const dictionaries = {
@@ -207,7 +208,6 @@ window.__ModuleLoader__.load({
 
       useEffect(() => {
         setDraft(current)
-        setNotice(null)
       }, [current, state?.revision])
 
       if (view === 'summary') return t('summary')
@@ -258,13 +258,17 @@ window.__ModuleLoader__.load({
           React.createElement(
             'div',
             { className: 'dsh-budget-tracker-config__head' },
-            React.createElement('h4', { className: 'dsh-budget-tracker-config__title' }, t('intro')),
+            React.createElement('h4', { id: TITLE_ID, className: 'dsh-budget-tracker-config__title' }, t('intro')),
             React.createElement('p', { className: 'dsh-budget-tracker-config__description' }, t('description')),
           ),
           ready
             ? React.createElement(
               'fieldset',
-              { className: 'dsh-budget-tracker-config__modes', disabled: !writable || busy !== null },
+              {
+                className: 'dsh-budget-tracker-config__modes',
+                disabled: !writable || busy !== null,
+                'aria-labelledby': TITLE_ID,
+              },
               ...MODES.map((mode) => {
                 const [titleKey, descriptionKey] = modeCopy[mode]
                 return React.createElement(
