@@ -1,6 +1,6 @@
 {
   "name": "dsh-budget-tracker",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "DeepSeek Harness budget tracker exposing remaining pressure budget before proactive compaction.",
   "type": "module",
   "main": "index.js",

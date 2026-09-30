@@ -6,7 +6,7 @@ export const name = 'dsh-budget-tracker'
 // the active compaction service for its resolved policy, the LLM service for
 // the current routed model capacity, and tokenMeter for the exact pressure
 // quantity used by compaction-basic.
-export const inject = ['agents', 'llm', 'tokenMeter', 'compaction']
+export const inject = ['agents']
 
 /**
  * Resolve the pressure fields that dsh-compaction-basic applies to one routed
@@ -130,9 +130,35 @@ function retainedBudgetText(session) {
   return undefined
 }
 
+/**
+ * Resolve one runtime service for an agent.
+ *
+ * Preset-owned services can live behind an isolate realm that agent.ctx cannot
+ * read directly. AgentPresetRegistry.serviceFor() addresses that mounted subtree
+ * by agent. Services not owned by the preset fall back to the agent-visible
+ * context and then the host context, preserving non-Web compositions.
+ */
+function serviceForAgent(ctx, agent, serviceName) {
+  const agentCtx = agent?.ctx
+  if (!agentCtx) return undefined
+
+  const presets = ctx.get?.('agentPresets')
+  const scoped = presets?.serviceFor?.(agent, serviceName)
+  if (scoped !== undefined) return scoped
+
+  return agentCtx.get?.(serviceName)
+    ?? ctx.get?.(serviceName)
+}
+
 /** Resolve the model-visible remaining budget after downstream pre-step work. */
 async function contextRemainingText(ctx, agent, signal) {
-  const config = ctx.compaction?.config
+  const compaction = serviceForAgent(ctx, agent, 'compaction')
+  const llm = serviceForAgent(ctx, agent, 'llm')
+  const tokenMeter = serviceForAgent(ctx, agent, 'tokenMeter')
+  if (typeof llm?.resolveModelInfo !== 'function'
+    || typeof tokenMeter?.measure !== 'function') return undefined
+
+  const config = compaction?.config
   const header = agent.session.requestHeader()
   if (!header) return undefined
 
@@ -146,7 +172,7 @@ async function contextRemainingText(ctx, agent, signal) {
 
   let info
   try {
-    info = await ctx.llm.resolveModelInfo(provider, model, signal)
+    info = await llm.resolveModelInfo(provider, model, signal)
   } catch {
     return undefined
   }
@@ -165,7 +191,7 @@ async function contextRemainingText(ctx, agent, signal) {
   // Deliberately totalTokens, not projectedTokens: this is the same numerator
   // dsh-compaction-basic checks. Running after next() means compaction/pruning
   // performed by downstream pre-step listeners is already reflected here.
-  const currentPressureTokens = ctx.tokenMeter.measure(agent.session).totalTokens
+  const currentPressureTokens = tokenMeter.measure(agent.session).totalTokens
   const remaining = calculateContextRemaining(thresholdTokens, currentPressureTokens)
   return remaining === undefined ? undefined : `context_remaining: ${remaining}`
 }

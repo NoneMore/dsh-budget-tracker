@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import {
   apply,
+  inject,
   calculateContextRemaining,
   calculateThresholdTokens,
   resolvePressurePolicy,
@@ -18,6 +19,10 @@ test('declares DeepSeek Harness 0.2 runtime compatibility', () => {
     manifest.peerDependencies['@deepseek-ai/dsh'],
     '>=0.2.0-rc.2 <0.3.0',
   )
+})
+
+test('only requires the host-level agent registry service', () => {
+  assert.deepEqual(inject, ['agents'])
 })
 
 test('reproduces the default compaction threshold shape', () => {
@@ -94,10 +99,16 @@ function integrationHarness({
   headerMaxTokens = 32_768,
   auto = true,
   retainedText,
+  scopedCompaction = true,
+  hostCompaction = false,
+  hasAgentPresets = true,
+  hasLlm = true,
+  hasTokenMeter = true,
 } = {}) {
   let currentTokens = beforeTokens
   let listener
   let options
+  const serviceLookups = []
 
   const retained = retainedText === undefined
     ? []
@@ -118,53 +129,142 @@ function integrationHarness({
     }),
   }
 
-  const ctx = {
-    compaction: {
-      config: {
-        auto,
-        thresholdRatio: 0.8,
-        headroomTokens: 65_536,
-        modelPolicies: [],
+  const compaction = {
+    config: {
+      auto,
+      thresholdRatio: 0.8,
+      headroomTokens: 65_536,
+      modelPolicies: [],
+    },
+  }
+  const llm = {
+    resolveModelInfo: async () => ({
+      context: { contextWindow },
+      ...(defaultMaxTokens === undefined ? {} : { defaultMaxTokens }),
+    }),
+  }
+  const tokenMeter = { measure: () => ({ totalTokens: currentTokens }) }
+
+  // DSH Web keeps compaction behind a preset-owned isolate realm. The agent
+  // context can inherit host services such as llm/tokenMeter, but it cannot
+  // directly resolve that isolated compaction service.
+  const hostServices = {
+    ...(hasAgentPresets ? {
+      agentPresets: {
+        serviceFor: (agent, serviceName) => {
+          serviceLookups.push({ agent, serviceName })
+          return scopedCompaction && serviceName === 'compaction'
+            ? compaction
+            : undefined
+        },
       },
+    } : {}),
+    ...(hasLlm ? { llm } : {}),
+    ...(hasTokenMeter ? { tokenMeter } : {}),
+    ...(hostCompaction ? { compaction } : {}),
+  }
+
+  // Cordis contexts reject undeclared service property access. Keep the harness
+  // strict so optional services must be read through ctx.get(), just like the
+  // real runtime.
+  const strictContext = api => new Proxy(api, {
+    get(target, property, receiver) {
+      if (typeof property === 'string' && !(property in target)) {
+        throw new Error(`undeclared context property access: ${property}`)
+      }
+      return Reflect.get(target, property, receiver)
     },
-    llm: {
-      resolveModelInfo: async () => ({
-        context: { contextWindow },
-        ...(defaultMaxTokens === undefined ? {} : { defaultMaxTokens }),
-      }),
-    },
-    tokenMeter: { measure: () => ({ totalTokens: currentTokens }) },
+  })
+
+  const agentCtx = strictContext({
+    get: serviceName => (
+      serviceName === 'compaction' && !hostCompaction
+        ? undefined
+        : hostServices[serviceName]
+    ),
+  })
+
+  const ctx = strictContext({
+    get: serviceName => hostServices[serviceName],
     on: (name, callback, listenerOptions) => {
       assert.equal(name, 'agent/pre-step')
       listener = callback
       options = listenerOptions
       return () => true
     },
-  }
+  })
 
   apply(ctx)
   return {
     options,
-    run: async ({ reject = false } = {}) => listener(
-      { agent: { session }, signal: new AbortController().signal },
-      async () => {
-        currentTokens = afterTokens
-        return reject ? { kind: 'reject' } : { kind: 'enter', messages: [] }
-      },
-    ),
+    serviceLookups,
+    run: async ({ reject = false } = {}) => {
+      const agent = { session, ctx: agentCtx }
+      return listener(
+        { agent, signal: new AbortController().signal },
+        async () => {
+          currentTokens = afterTokens
+          return reject ? { kind: 'reject' } : { kind: 'enter', messages: [] }
+        },
+      )
+    },
   }
 }
 
-test('prepends its pre-step wrapper and measures after downstream compaction', async () => {
+test('resolves preset-isolated compaction and measures after downstream compaction', async () => {
   const harness = integrationHarness()
   assert.deepEqual(harness.options, { prepend: true })
 
   const decision = await harness.run()
+  assert.equal(
+    harness.serviceLookups.some(({ serviceName }) => serviceName === 'compaction'),
+    true,
+  )
   assert.equal(decision.kind, 'enter')
   assert.equal(decision.messages.length, 1)
   assert.equal(decision.messages[0].content[0].text, 'context_remaining: 500000')
   assert.equal(decision.messages[0].source.kind, 'dsh-budget-tracker')
   assert.equal(decision.messages[0].source.form, 'snapshot')
+})
+
+test('falls back to a host-visible compaction service outside preset isolation', async () => {
+  const harness = integrationHarness({
+    scopedCompaction: false,
+    hostCompaction: true,
+  })
+  const decision = await harness.run()
+  assert.equal(decision.messages[0].content[0].text, 'context_remaining: 500000')
+})
+
+test('falls back to host services when no preset registry is installed', async () => {
+  const harness = integrationHarness({
+    scopedCompaction: false,
+    hostCompaction: true,
+    hasAgentPresets: false,
+  })
+  const decision = await harness.run()
+  assert.equal(decision.messages[0].content[0].text, 'context_remaining: 500000')
+})
+
+test('emits no budget when the agent has no active compaction service', async () => {
+  const harness = integrationHarness({
+    scopedCompaction: false,
+    hostCompaction: false,
+  })
+  const decision = await harness.run()
+  assert.deepEqual(decision, { kind: 'enter', messages: [] })
+})
+
+test('emits no budget when the LLM service is unavailable', async () => {
+  const harness = integrationHarness({ hasLlm: false })
+  const decision = await harness.run()
+  assert.deepEqual(decision, { kind: 'enter', messages: [] })
+})
+
+test('emits no budget when the token meter service is unavailable', async () => {
+  const harness = integrationHarness({ hasTokenMeter: false })
+  const decision = await harness.run()
+  assert.deepEqual(decision, { kind: 'enter', messages: [] })
 })
 
 test('uses current routed model capacity rather than a stale persisted capacity', async () => {

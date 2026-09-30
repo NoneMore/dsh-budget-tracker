@@ -12,7 +12,7 @@ No search budget, browse budget, HIGH/MEDIUM/LOW policy, replanning, or extra gu
 
 ## Compatibility
 
-Version 0.2.2 targets DeepSeek Harness 0.2.x starting with
+Version 0.2.3 targets DeepSeek Harness 0.2.x starting with
 `dsh-v0.2.0-rc.2`.
 
 ```text
@@ -64,10 +64,10 @@ For the routed model capacity it resolves the current model metadata through Har
 For the pressure numerator it deliberately uses:
 
 ```js
-ctx.tokenMeter.measure(session).totalTokens
+tokenMeter.measure(session).totalTokens
 ```
 
-because that is the same quantity `dsh-compaction-basic` compares with `thresholdTokens` during its `agent/pre-step` pressure check.
+where `tokenMeter` is resolved for the current agent. This is the same quantity `dsh-compaction-basic` compares with `thresholdTokens` during its `agent/pre-step` pressure check.
 
 Example:
 
@@ -86,10 +86,13 @@ context_remaining         =   190,000
 
 The value follows the **latest durable routed provider/model**, which is also the route `dsh-compaction-basic` evaluates at the next `agent/pre-step` pressure check.
 
+On DSH Web, presets that enable compaction (including the shipped `standard`, `ptc`, and `cordis` presets) mount it inside an isolated scope rather than as a host-global service. The tracker is installed once at the host level, resolves preset-owned services with `agentPresets.serviceFor(agent, ...)`, and falls back to services visible through the current agent/host context for shared capabilities such as `llm` and `tokenMeter`. This crosses the preset isolate boundary without requiring a host-global compaction service, so the tracker reads the same compaction engine that is actually driving that session.
+
 The tracker installs a prepended `agent/pre-step` wrapper and computes only after `next()` returns. This means any downstream pruning or proactive compaction has already completed before `context_remaining` is measured and injected into the request. A step that compacts therefore sees the **post-compaction** remaining budget, not the stale value that triggered compaction.
 
 The first request of a fresh session has no prior durable route, so the plugin emits nothing. It also emits nothing when:
 
+- no active compaction service is available for the agent;
 - automatic compaction is disabled with `auto: false`;
 - no routed context capacity is available;
 - routed model metadata cannot be resolved;
