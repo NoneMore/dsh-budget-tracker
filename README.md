@@ -10,6 +10,27 @@ context_remaining: 190000
 
 No search budget, browse budget, HIGH/MEDIUM/LOW policy, replanning, or extra guidance is added.
 
+## Compatibility
+
+Version 0.2.2 targets DeepSeek Harness 0.2.x starting with
+`dsh-v0.2.0-rc.2`.
+
+```text
+DeepSeek Harness: >=0.2.0-rc.2 <0.3.0
+Node.js:          ^22.19.0 || >=24.0.0
+```
+
+The package declares `@deepseek-ai/dsh` as a peer dependency so Harness 0.2's
+plugin compatibility gate can reject an incompatible runtime before activation.
+Profile installations use the Harness-provided runtime; the plugin does not
+bundle a second DSH copy.
+
+The APIs this plugin relies on — `agent/pre-step`, the token meter,
+`requestHeader()`, routed model metadata, and `dsh-compaction-basic` pressure
+resolution — are unchanged in `dsh-v0.2.0-rc.2` from the preceding release
+candidate line, so the budget calculation itself does not need a compatibility
+shim.
+
 ## What `context_remaining` means
 
 `context_remaining` is **not** the distance to the model's absolute context-window limit.
@@ -110,7 +131,7 @@ After the repository is public (or when your Git credentials allow access to the
 dsh plugin --profile <profile> add github:NoneMore/dsh-budget-tracker
 ```
 
-This package is plain JavaScript, has no runtime dependencies, and has no build/prepare step.
+This package is plain JavaScript, has no bundled runtime dependencies, and has no build/prepare step.
 
 ## Test
 
