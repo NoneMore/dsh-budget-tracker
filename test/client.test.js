@@ -139,6 +139,10 @@ function textContent(node) {
   return textContent(node.props?.children)
 }
 
+function plain(value) {
+  return JSON.parse(JSON.stringify(value))
+}
+
 function readyState(promptMode, {
   revision = 1,
   user = {},
@@ -184,7 +188,7 @@ test('browser prompt mode form saves a staged mode with the current revision', a
   formNode.props.onSubmit({ preventDefault: () => { prevented = true } })
 
   assert.equal(prevented, true)
-  assert.deepEqual(calls, [[
+  assert.deepEqual(plain(calls), [[
     [{ op: 'set', path: ['promptMode'], value: 'planning' }],
     7,
   ]])
@@ -234,7 +238,7 @@ test('browser prompt mode form resets the profile override with the current revi
   assert.ok(reset)
   reset.props.onClick()
 
-  assert.deepEqual(calls, [[
+  assert.deepEqual(plain(calls), [[
     [{ op: 'unset', path: ['promptMode'] }],
     11,
   ]])
