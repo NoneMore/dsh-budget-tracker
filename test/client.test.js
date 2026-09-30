@@ -193,8 +193,7 @@ test('browser prompt mode form saves a staged mode with the current revision', a
     7,
   ]])
 
-  await Promise.resolve()
-  await Promise.resolve()
+  await new Promise(resolve => setImmediate(resolve))
   tree = render(component, props)
   assert.equal(
     findAll(tree, node => node.type === 'p' && node.props.role === 'status')
