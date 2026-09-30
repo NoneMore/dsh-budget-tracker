@@ -1,6 +1,6 @@
 {
   "name": "dsh-budget-tracker",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "DeepSeek Harness budget tracker exposing remaining pressure budget before proactive compaction.",
   "type": "module",
   "main": "index.js",
@@ -23,7 +23,10 @@
   ],
   "license": "MIT",
   "engines": {
-    "node": ">=20"
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.2.0-rc.2 <0.3.0"
   },
   "repository": {
     "type": "git",
