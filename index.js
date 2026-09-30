@@ -2,6 +2,50 @@ import { randomUUID } from 'node:crypto'
 
 export const name = 'dsh-budget-tracker'
 
+export const PROMPT_MODES = Object.freeze(['none', 'semantic', 'planning', 'behavioral'])
+export const DEFAULT_PROMPT_MODE = 'semantic'
+export const PROMPT_SECTION_NAME = 'budget-tracker:context-remaining-guidance'
+export const PROMPT_SECTION_ORDER = 9800
+
+const PROMPT_TEXT = Object.freeze({
+  semantic: 'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder.',
+  planning: 'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder. Use it as a context-pressure signal when deciding how much context to spend on the current response.',
+  behavioral: 'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder. Use it as a context-pressure signal when deciding how much context to spend on the current response. As the remaining budget decreases, actively limit avoidable context growth: prioritize essential information, avoid unnecessary restatement, keep intermediate outputs compact, and prefer completing the current task over opening large new lines of work. Do not invent numeric thresholds or treat the value as a hard limit.',
+})
+
+/**
+ * Resolve the optional static system-prompt guidance for one configured mode.
+ *
+ * `semantic` only disambiguates the field. `planning` adds lightweight usage
+ * guidance. `behavioral` additionally guides context-conserving behavior without
+ * inventing thresholds or changing compaction policy.
+ *
+ * @param {string | undefined} mode
+ * @returns {string | undefined}
+ */
+export function resolvePromptText(mode = DEFAULT_PROMPT_MODE) {
+  if (mode === 'none') return undefined
+  const text = PROMPT_TEXT[mode]
+  if (text !== undefined) return text
+  throw new TypeError(
+    'dsh-budget-tracker: promptMode must be one of ' + PROMPT_MODES.join(', '),
+  )
+}
+
+/** Register the configured static explanation without changing snapshot semantics. */
+function registerPrompt(ctx, mode) {
+  const text = resolvePromptText(mode)
+  if (text === undefined) return
+
+  ctx.inject(['systemPrompt'], (inner) => {
+    inner.effect(() => inner.systemPrompt.section({
+      name: PROMPT_SECTION_NAME,
+      order: PROMPT_SECTION_ORDER,
+      text,
+      interpolate: false,
+    }), 'dsh-budget-tracker system prompt')
+  })
+}
 // The tracker intentionally follows dsh-compaction-basic's pressure semantics:
 // the active compaction service for its resolved policy, the LLM service for
 // the current routed model capacity, and tokenMeter for the exact pressure
@@ -203,7 +247,9 @@ async function contextRemainingText(ctx, agent, signal) {
  * next(), so any dsh-compaction-basic pruning/compaction in that chain lands
  * before the model-visible budget snapshot is measured.
  */
-export function apply(ctx) {
+export function apply(ctx, config = {}) {
+  registerPrompt(ctx, config?.promptMode ?? DEFAULT_PROMPT_MODE)
+
   return ctx.on('agent/pre-step', async (
     { agent, signal },
     next,

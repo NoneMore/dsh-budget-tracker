@@ -4,6 +4,10 @@ import { readFileSync } from 'node:fs'
 import {
   apply,
   inject,
+  DEFAULT_PROMPT_MODE,
+  PROMPT_SECTION_NAME,
+  PROMPT_SECTION_ORDER,
+  resolvePromptText,
   calculateContextRemaining,
   calculateThresholdTokens,
   resolvePressurePolicy,
@@ -23,6 +27,39 @@ test('declares DeepSeek Harness 0.2 runtime compatibility', () => {
 
 test('only requires the host-level agent registry service', () => {
   assert.deepEqual(inject, ['agents'])
+})
+
+test('defaults to semantic-only prompt guidance', () => {
+  assert.equal(DEFAULT_PROMPT_MODE, 'semantic')
+  assert.equal(
+    resolvePromptText(),
+    'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder.',
+  )
+})
+
+test('planning mode adds lightweight context-pressure guidance', () => {
+  assert.equal(
+    resolvePromptText('planning'),
+    'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder. Use it as a context-pressure signal when deciding how much context to spend on the current response.',
+  )
+})
+
+test('behavioral mode guides context-conserving behavior', () => {
+  assert.equal(
+    resolvePromptText('behavioral'),
+    'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder. Use it as a context-pressure signal when deciding how much context to spend on the current response. As the remaining budget decreases, actively limit avoidable context growth: prioritize essential information, avoid unnecessary restatement, keep intermediate outputs compact, and prefer completing the current task over opening large new lines of work. Do not invent numeric thresholds or treat the value as a hard limit.',
+  )
+})
+
+test('none mode disables static prompt guidance', () => {
+  assert.equal(resolvePromptText('none'), undefined)
+})
+
+test('rejects unknown prompt modes', () => {
+  assert.throws(
+    () => resolvePromptText('aggressive'),
+    /promptMode must be one of none, semantic, planning, behavioral/,
+  )
 })
 
 test('reproduces the default compaction threshold shape', () => {
@@ -104,10 +141,13 @@ function integrationHarness({
   hasAgentPresets = true,
   hasLlm = true,
   hasTokenMeter = true,
+  promptMode,
 } = {}) {
   let currentTokens = beforeTokens
   let listener
   let options
+  let promptSection
+  let promptInjectCalls = 0
   const serviceLookups = []
 
   const retained = retainedText === undefined
@@ -186,6 +226,19 @@ function integrationHarness({
 
   const ctx = strictContext({
     get: serviceName => hostServices[serviceName],
+    inject: (services, callback) => {
+      assert.deepEqual(services, ['systemPrompt'])
+      promptInjectCalls += 1
+      return callback(strictContext({
+        effect: factory => factory(),
+        systemPrompt: strictContext({
+          section: section => {
+            promptSection = section
+            return () => true
+          },
+        }),
+      }))
+    },
     on: (name, callback, listenerOptions) => {
       assert.equal(name, 'agent/pre-step')
       listener = callback
@@ -194,10 +247,12 @@ function integrationHarness({
     },
   })
 
-  apply(ctx)
+  apply(ctx, promptMode === undefined ? undefined : { promptMode })
   return {
     options,
     serviceLookups,
+    promptSection,
+    promptInjectCalls,
     run: async ({ reject = false } = {}) => {
       const agent = { session, ctx: agentCtx }
       return listener(
@@ -210,6 +265,35 @@ function integrationHarness({
     },
   }
 }
+
+test('registers semantic system-prompt guidance by default', () => {
+  const harness = integrationHarness()
+  assert.equal(harness.promptInjectCalls, 1)
+  assert.deepEqual(harness.promptSection, {
+    name: PROMPT_SECTION_NAME,
+    order: PROMPT_SECTION_ORDER,
+    text: resolvePromptText('semantic'),
+    interpolate: false,
+  })
+})
+
+test('registers planning guidance when configured', () => {
+  const harness = integrationHarness({ promptMode: 'planning' })
+  assert.equal(harness.promptInjectCalls, 1)
+  assert.equal(harness.promptSection.text, resolvePromptText('planning'))
+})
+
+test('registers behavioral guidance when configured', () => {
+  const harness = integrationHarness({ promptMode: 'behavioral' })
+  assert.equal(harness.promptInjectCalls, 1)
+  assert.equal(harness.promptSection.text, resolvePromptText('behavioral'))
+})
+
+test('none prompt mode leaves the system prompt untouched', () => {
+  const harness = integrationHarness({ promptMode: 'none' })
+  assert.equal(harness.promptInjectCalls, 0)
+  assert.equal(harness.promptSection, undefined)
+})
 
 test('resolves preset-isolated compaction and measures after downstream compaction', async () => {
   const harness = integrationHarness()
