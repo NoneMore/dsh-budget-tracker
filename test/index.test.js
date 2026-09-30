@@ -99,10 +99,13 @@ function integrationHarness({
   headerMaxTokens = 32_768,
   auto = true,
   retainedText,
+  scopedCompaction = true,
+  hostCompaction = false,
 } = {}) {
   let currentTokens = beforeTokens
   let listener
   let options
+  const serviceLookups = []
 
   const retained = retainedText === undefined
     ? []
@@ -123,27 +126,48 @@ function integrationHarness({
     }),
   }
 
-  const agentCtx = {
-    compaction: {
-      config: {
-        auto,
-        thresholdRatio: 0.8,
-        headroomTokens: 65_536,
-        modelPolicies: [],
+  const compaction = {
+    config: {
+      auto,
+      thresholdRatio: 0.8,
+      headroomTokens: 65_536,
+      modelPolicies: [],
+    },
+  }
+  const llm = {
+    resolveModelInfo: async () => ({
+      context: { contextWindow },
+      ...(defaultMaxTokens === undefined ? {} : { defaultMaxTokens }),
+    }),
+  }
+  const tokenMeter = { measure: () => ({ totalTokens: currentTokens }) }
+
+  // DSH Web keeps compaction behind a preset-owned isolate realm. The agent
+  // context can inherit host services such as llm/tokenMeter, but it cannot
+  // directly resolve that isolated compaction service.
+  const hostServices = {
+    agentPresets: {
+      serviceFor: (agent, serviceName) => {
+        serviceLookups.push({ agent, serviceName })
+        return scopedCompaction && serviceName === 'compaction'
+          ? compaction
+          : undefined
       },
     },
-    llm: {
-      resolveModelInfo: async () => ({
-        context: { contextWindow },
-        ...(defaultMaxTokens === undefined ? {} : { defaultMaxTokens }),
-      }),
-    },
-    tokenMeter: { measure: () => ({ totalTokens: currentTokens }) },
+    llm,
+    tokenMeter,
+    ...(hostCompaction ? { compaction } : {}),
+  }
+  const agentCtx = {
+    get: serviceName => (
+      serviceName === 'compaction' && !hostCompaction
+        ? undefined
+        : hostServices[serviceName]
+    ),
   }
 
-  // The host plugin context intentionally has no compaction/LLM/token-meter
-  // services. DSH Web mounts those capabilities inside each agent preset.
   const ctx = {
+    get: serviceName => hostServices[serviceName],
     on: (name, callback, listenerOptions) => {
       assert.equal(name, 'agent/pre-step')
       listener = callback
@@ -155,26 +179,52 @@ function integrationHarness({
   apply(ctx)
   return {
     options,
-    run: async ({ reject = false } = {}) => listener(
-      { agent: { session, ctx: agentCtx }, signal: new AbortController().signal },
-      async () => {
-        currentTokens = afterTokens
-        return reject ? { kind: 'reject' } : { kind: 'enter', messages: [] }
-      },
-    ),
+    serviceLookups,
+    run: async ({ reject = false } = {}) => {
+      const agent = { session, ctx: agentCtx }
+      return listener(
+        { agent, signal: new AbortController().signal },
+        async () => {
+          currentTokens = afterTokens
+          return reject ? { kind: 'reject' } : { kind: 'enter', messages: [] }
+        },
+      )
+    },
   }
 }
 
-test('prepends its pre-step wrapper and measures after downstream compaction', async () => {
+test('resolves preset-isolated compaction and measures after downstream compaction', async () => {
   const harness = integrationHarness()
   assert.deepEqual(harness.options, { prepend: true })
 
   const decision = await harness.run()
+  assert.equal(
+    harness.serviceLookups.some(({ serviceName }) => serviceName === 'compaction'),
+    true,
+  )
   assert.equal(decision.kind, 'enter')
   assert.equal(decision.messages.length, 1)
   assert.equal(decision.messages[0].content[0].text, 'context_remaining: 500000')
   assert.equal(decision.messages[0].source.kind, 'dsh-budget-tracker')
   assert.equal(decision.messages[0].source.form, 'snapshot')
+})
+
+test('falls back to a host-visible compaction service outside preset isolation', async () => {
+  const harness = integrationHarness({
+    scopedCompaction: false,
+    hostCompaction: true,
+  })
+  const decision = await harness.run()
+  assert.equal(decision.messages[0].content[0].text, 'context_remaining: 500000')
+})
+
+test('emits no budget when the agent has no active compaction service', async () => {
+  const harness = integrationHarness({
+    scopedCompaction: false,
+    hostCompaction: false,
+  })
+  const decision = await harness.run()
+  assert.deepEqual(decision, { kind: 'enter', messages: [] })
 })
 
 test('uses current routed model capacity rather than a stale persisted capacity', async () => {
