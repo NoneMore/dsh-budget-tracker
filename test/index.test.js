@@ -44,6 +44,13 @@ test('planning mode adds lightweight context-pressure guidance', () => {
   )
 })
 
+test('behavioral mode guides context-conserving behavior', () => {
+  assert.equal(
+    resolvePromptText('behavioral'),
+    'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder. Use it as a context-pressure signal when deciding how much context to spend on the current response. As the remaining budget decreases, actively limit avoidable context growth: prioritize essential information, avoid unnecessary restatement, keep intermediate outputs compact, and prefer completing the current task over opening large new lines of work. Do not invent numeric thresholds or treat the value as a hard limit.',
+  )
+})
+
 test('none mode disables static prompt guidance', () => {
   assert.equal(resolvePromptText('none'), undefined)
 })
@@ -51,7 +58,7 @@ test('none mode disables static prompt guidance', () => {
 test('rejects unknown prompt modes', () => {
   assert.throws(
     () => resolvePromptText('aggressive'),
-    /promptMode must be one of none, semantic, planning/,
+    /promptMode must be one of none, semantic, planning, behavioral/,
   )
 })
 
@@ -274,6 +281,12 @@ test('registers planning guidance when configured', () => {
   const harness = integrationHarness({ promptMode: 'planning' })
   assert.equal(harness.promptInjectCalls, 1)
   assert.equal(harness.promptSection.text, resolvePromptText('planning'))
+})
+
+test('registers behavioral guidance when configured', () => {
+  const harness = integrationHarness({ promptMode: 'behavioral' })
+  assert.equal(harness.promptInjectCalls, 1)
+  assert.equal(harness.promptSection.text, resolvePromptText('behavioral'))
 })
 
 test('none prompt mode leaves the system prompt untouched', () => {
