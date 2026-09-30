@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import {
   apply,
+  inject,
   calculateContextRemaining,
   calculateThresholdTokens,
   resolvePressurePolicy,
@@ -18,6 +19,10 @@ test('declares DeepSeek Harness 0.2 runtime compatibility', () => {
     manifest.peerDependencies['@deepseek-ai/dsh'],
     '>=0.2.0-rc.2 <0.3.0',
   )
+})
+
+test('only requires the host-level agent registry service', () => {
+  assert.deepEqual(inject, ['agents'])
 })
 
 test('reproduces the default compaction threshold shape', () => {
@@ -118,7 +123,7 @@ function integrationHarness({
     }),
   }
 
-  const ctx = {
+  const agentCtx = {
     compaction: {
       config: {
         auto,
@@ -134,6 +139,11 @@ function integrationHarness({
       }),
     },
     tokenMeter: { measure: () => ({ totalTokens: currentTokens }) },
+  }
+
+  // The host plugin context intentionally has no compaction/LLM/token-meter
+  // services. DSH Web mounts those capabilities inside each agent preset.
+  const ctx = {
     on: (name, callback, listenerOptions) => {
       assert.equal(name, 'agent/pre-step')
       listener = callback
@@ -146,7 +156,7 @@ function integrationHarness({
   return {
     options,
     run: async ({ reject = false } = {}) => listener(
-      { agent: { session }, signal: new AbortController().signal },
+      { agent: { session, ctx: agentCtx }, signal: new AbortController().signal },
       async () => {
         currentTokens = afterTokens
         return reject ? { kind: 'reject' } : { kind: 'enter', messages: [] }
