@@ -12,7 +12,7 @@ No search budget, browse budget, HIGH/MEDIUM/LOW policy, replanning, or extra gu
 
 ## Compatibility
 
-Version 0.2.2 targets DeepSeek Harness 0.2.x starting with
+Version 0.2.3 targets DeepSeek Harness 0.2.x starting with
 `dsh-v0.2.0-rc.2`.
 
 ```text
@@ -85,6 +85,8 @@ context_remaining         =   190,000
 ## Timing semantics
 
 The value follows the **latest durable routed provider/model**, which is also the route `dsh-compaction-basic` evaluates at the next `agent/pre-step` pressure check.
+
+On DSH Web, compaction is mounted inside each agent preset's isolated scope rather than as a host-global service. The tracker is installed once at the host level, but resolves `compaction`, `llm`, and `tokenMeter` through the current `agent.ctx` during `agent/pre-step`, so it sees the same preset-scoped compaction engine that is actually driving that session.
 
 The tracker installs a prepended `agent/pre-step` wrapper and computes only after `next()` returns. This means any downstream pruning or proactive compaction has already completed before `context_remaining` is measured and injected into the request. A step that compacts therefore sees the **post-compaction** remaining budget, not the stale value that triggered compaction.
 
