@@ -108,6 +108,7 @@ The dynamic budget snapshot and the static system-prompt explanation are deliber
 | --- | --- |
 | `semantic` | **Default.** Explains that `context_remaining` is the budget before proactive compaction, not the model's absolute context-window remainder. |
 | `planning` | Includes the semantic explanation and asks the model to use the value as a context-pressure signal when deciding how much context to spend on the current response. |
+| `behavioral` | Builds on `planning` and actively guides context-conserving behavior as the budget decreases: prioritize essentials, avoid unnecessary restatement, keep intermediate outputs compact, and prefer finishing current work over opening large new lines of work. It still defines no numeric thresholds. |
 | `none` | Adds no static prompt guidance, matching the pre-prompt behavior of the plugin. |
 
 The bundled patch defaults to:
@@ -117,7 +118,7 @@ config:
   promptMode: semantic
 ```
 
-Unknown mode values fail plugin activation instead of silently selecting a policy. Neither prompt-enabled mode introduces numeric thresholds, search/browse budgets, replanning rules, or tool restrictions.
+Unknown mode values fail plugin activation instead of silently selecting a policy. No mode changes the budget calculation or compaction policy. Even `behavioral` defines no numeric thresholds, search/browse budgets, or hard tool restrictions.
 
 ## Dynamic context
 
@@ -163,7 +164,7 @@ npm test
 
 ## Design goal
 
-This is inspired by the budget-awareness idea in Google's `budget-aware-agent`, but intentionally does not port its search/browse budget machinery. DeepSeek Harness already owns pressure measurement and compaction policy; this plugin surfaces the remaining pre-compaction budget and, when configured, only clarifies how that field should be interpreted.
+This is inspired by the budget-awareness idea in Google's `budget-aware-agent`, but intentionally does not port its search/browse budget machinery. DeepSeek Harness already owns pressure measurement and compaction policy; this plugin surfaces the remaining pre-compaction budget and optionally adds progressively stronger guidance for interpreting and acting on that signal.
 
 ## License
 
