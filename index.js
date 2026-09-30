@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 
 export const name = 'dsh-budget-tracker'
 
-export const PROMPT_MODES = Object.freeze(['none', 'semantic', 'planning'])
+export const PROMPT_MODES = Object.freeze(['none', 'semantic', 'planning', 'behavioral'])
 export const DEFAULT_PROMPT_MODE = 'semantic'
 export const PROMPT_SECTION_NAME = 'budget-tracker:context-remaining-guidance'
 export const PROMPT_SECTION_ORDER = 9800
@@ -10,13 +10,15 @@ export const PROMPT_SECTION_ORDER = 9800
 const PROMPT_TEXT = Object.freeze({
   semantic: 'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder.',
   planning: 'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder. Use it as a context-pressure signal when deciding how much context to spend on the current response.',
+  behavioral: 'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder. Use it as a context-pressure signal when deciding how much context to spend on the current response. As the remaining budget decreases, actively limit avoidable context growth: prioritize essential information, avoid unnecessary restatement, keep intermediate outputs compact, and prefer completing the current task over opening large new lines of work. Do not invent numeric thresholds or treat the value as a hard limit.',
 })
 
 /**
  * Resolve the optional static system-prompt guidance for one configured mode.
  *
  * `semantic` only disambiguates the field. `planning` adds lightweight usage
- * guidance without introducing thresholds, replanning rules, or tool policy.
+ * guidance. `behavioral` additionally guides context-conserving behavior without
+ * inventing thresholds or changing compaction policy.
  *
  * @param {string | undefined} mode
  * @returns {string | undefined}
