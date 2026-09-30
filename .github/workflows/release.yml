@@ -23,6 +23,9 @@ jobs:
         with:
           node-version: 22.19.0
 
+      - name: Install dependencies
+        run: npm install --ignore-scripts --omit=peer --no-audit --no-fund
+
       - name: Verify
         run: |
           npm test
