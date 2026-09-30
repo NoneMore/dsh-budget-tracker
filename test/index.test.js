@@ -1,11 +1,24 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import {
   apply,
   calculateContextRemaining,
   calculateThresholdTokens,
   resolvePressurePolicy,
 } from '../index.js'
+
+test('declares DeepSeek Harness 0.2 runtime compatibility', () => {
+  const manifest = JSON.parse(
+    readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+  )
+
+  assert.equal(manifest.engines.node, '^22.19.0 || >=24.0.0')
+  assert.equal(
+    manifest.peerDependencies['@deepseek-ai/dsh'],
+    '>=0.2.0-rc.2 <0.3.0',
+  )
+})
 
 test('reproduces the default compaction threshold shape', () => {
   assert.equal(
