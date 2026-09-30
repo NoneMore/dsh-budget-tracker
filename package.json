@@ -12,7 +12,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test"
+    "test": "node --check client.js && node --test"
   },
   "keywords": [
     "deepseek",
