@@ -4,9 +4,11 @@ import { readFileSync } from 'node:fs'
 import {
   apply,
   inject,
+  Config,
   DEFAULT_PROMPT_MODE,
   PROMPT_SECTION_NAME,
   PROMPT_SECTION_ORDER,
+  currentPromptMode,
   resolvePromptText,
   calculateContextRemaining,
   calculateThresholdTokens,
@@ -23,10 +25,29 @@ test('declares DeepSeek Harness 0.2 runtime compatibility', () => {
     manifest.peerDependencies['@deepseek-ai/dsh'],
     '>=0.2.0-rc.2 <0.3.0',
   )
+  assert.equal(manifest.dependencies['@deepseek-ai/schemastery'], '^3.18.4')
+  assert.equal(manifest.exports['./client'], './client.js')
+  assert.deepEqual(manifest.dsh.client, {
+    platform: 'web',
+    inject: [
+      '@deepseek-ai/dsh-client-locale',
+      '@deepseek-ai/dsh-client-ui-plugin-manager',
+    ],
+  })
 })
 
 test('only requires the host-level agent registry service', () => {
   assert.deepEqual(inject, ['agents'])
+})
+
+test('exports a schemastery Config for the Web-editable prompt mode', () => {
+  assert.equal(typeof Config, 'function')
+})
+
+test('reads direct and volatile prompt mode values', () => {
+  assert.equal(currentPromptMode({ promptMode: 'planning' }), 'planning')
+  assert.equal(currentPromptMode({ promptMode: { get: () => 'behavioral' } }), 'behavioral')
+  assert.equal(currentPromptMode(), DEFAULT_PROMPT_MODE)
 })
 
 test('defaults to semantic-only prompt guidance', () => {
@@ -148,6 +169,7 @@ function integrationHarness({
   let options
   let promptSection
   let promptInjectCalls = 0
+  let settingsConfigurePolicy
   const serviceLookups = []
 
   const retained = retainedText === undefined
@@ -227,18 +249,32 @@ function integrationHarness({
   const ctx = strictContext({
     get: serviceName => hostServices[serviceName],
     inject: (services, callback) => {
-      assert.deepEqual(services, ['systemPrompt'])
-      promptInjectCalls += 1
-      return callback(strictContext({
-        effect: factory => factory(),
-        systemPrompt: strictContext({
-          section: section => {
-            promptSection = section
-            return () => true
-          },
-        }),
-      }))
+      if (services.length === 1 && services[0] === 'systemPrompt') {
+        promptInjectCalls += 1
+        return callback(strictContext({
+          effect: factory => factory(),
+          systemPrompt: strictContext({
+            section: section => {
+              promptSection = section
+              return () => true
+            },
+          }),
+        }))
+      }
+      if (services.length === 1 && services[0] === 'settings') {
+        return callback(strictContext({
+          effect: factory => factory(),
+          settings: strictContext({
+            configure: (policy, fiber) => {
+              settingsConfigurePolicy = { policy, fiber }
+              return () => true
+            },
+          }),
+        }))
+      }
+      throw new Error('unexpected injected services: ' + services.join(','))
     },
+    fiber: { id: 'budget-tracker-fiber' },
     on: (name, callback, listenerOptions) => {
       assert.equal(name, 'agent/pre-step')
       listener = callback
@@ -253,6 +289,7 @@ function integrationHarness({
     serviceLookups,
     promptSection,
     promptInjectCalls,
+    settingsConfigurePolicy,
     run: async ({ reject = false } = {}) => {
       const agent = { session, ctx: agentCtx }
       return listener(
@@ -269,30 +306,45 @@ function integrationHarness({
 test('registers semantic system-prompt guidance by default', () => {
   const harness = integrationHarness()
   assert.equal(harness.promptInjectCalls, 1)
-  assert.deepEqual(harness.promptSection, {
-    name: PROMPT_SECTION_NAME,
-    order: PROMPT_SECTION_ORDER,
-    text: resolvePromptText('semantic'),
-    interpolate: false,
-  })
+  assert.deepEqual(
+    {
+      name: harness.promptSection.name,
+      order: harness.promptSection.order,
+      interpolate: harness.promptSection.interpolate,
+    },
+    {
+      name: PROMPT_SECTION_NAME,
+      order: PROMPT_SECTION_ORDER,
+      interpolate: false,
+    },
+  )
+  assert.equal(harness.promptSection.text(), resolvePromptText('semantic'))
 })
 
 test('registers planning guidance when configured', () => {
   const harness = integrationHarness({ promptMode: 'planning' })
   assert.equal(harness.promptInjectCalls, 1)
-  assert.equal(harness.promptSection.text, resolvePromptText('planning'))
+  assert.equal(harness.promptSection.text(), resolvePromptText('planning'))
 })
 
 test('registers behavioral guidance when configured', () => {
   const harness = integrationHarness({ promptMode: 'behavioral' })
   assert.equal(harness.promptInjectCalls, 1)
-  assert.equal(harness.promptSection.text, resolvePromptText('behavioral'))
+  assert.equal(harness.promptSection.text(), resolvePromptText('behavioral'))
 })
 
-test('none prompt mode leaves the system prompt untouched', () => {
+test('none prompt mode renders an empty static section', () => {
   const harness = integrationHarness({ promptMode: 'none' })
-  assert.equal(harness.promptInjectCalls, 0)
-  assert.equal(harness.promptSection, undefined)
+  assert.equal(harness.promptInjectCalls, 1)
+  assert.equal(harness.promptSection.text(), '')
+})
+
+test('marks the settings form as plugin-owned instead of auto-generated', () => {
+  const harness = integrationHarness()
+  assert.deepEqual(harness.settingsConfigurePolicy, {
+    policy: { auto: false },
+    fiber: { id: 'budget-tracker-fiber' },
+  })
 })
 
 test('resolves preset-isolated compaction and measures after downstream compaction', async () => {
