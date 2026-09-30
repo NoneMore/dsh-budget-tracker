@@ -12,7 +12,7 @@ No search budget, browse budget, HIGH/MEDIUM/LOW policy, replanning, or threshol
 
 ## Compatibility
 
-Version 0.2.3 targets DeepSeek Harness 0.2.x starting with
+Version 0.3.0 targets DeepSeek Harness 0.2.x starting with
 `dsh-v0.2.0-rc.2`.
 
 ```text
