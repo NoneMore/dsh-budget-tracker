@@ -8,7 +8,7 @@ It exposes exactly one model-visible budget field:
 context_remaining: 190000
 ```
 
-No search budget, browse budget, HIGH/MEDIUM/LOW policy, replanning, or extra guidance is added.
+No search budget, browse budget, HIGH/MEDIUM/LOW policy, replanning, or threshold policy is added. An optional static system-prompt hint can explain how to interpret the field; it never changes the budget calculation.
 
 ## Compatibility
 
@@ -100,11 +100,30 @@ The first request of a fresh session has no prior durable route, so the plugin e
 
 It does not fall back to the model's absolute context-window remainder, because that would give the same field two different meanings.
 
+## Prompt modes
+
+The dynamic budget snapshot and the static system-prompt explanation are deliberately separate. Configure `promptMode` on the plugin row:
+
+| Mode | Static system-prompt behavior |
+| --- | --- |
+| `semantic` | **Default.** Explains that `context_remaining` is the budget before proactive compaction, not the model's absolute context-window remainder. |
+| `planning` | Includes the semantic explanation and asks the model to use the value as a context-pressure signal when deciding how much context to spend on the current response. |
+| `none` | Adds no static prompt guidance, matching the pre-prompt behavior of the plugin. |
+
+The bundled patch defaults to:
+
+```yaml
+config:
+  promptMode: semantic
+```
+
+Unknown mode values fail plugin activation instead of silently selecting a policy. Neither prompt-enabled mode introduces numeric thresholds, search/browse budgets, replanning rules, or tool restrictions.
+
 ## Dynamic context
 
 The value is added as a source-attributed snapshot context message after the pre-step chain settles. If the same retained value is already present, the plugin does not add a duplicate snapshot.
 
-The model-visible text remains exactly one field:
+The dynamic model-visible snapshot remains exactly one field:
 
 ```text
 context_remaining: <tokens>
@@ -144,7 +163,7 @@ npm test
 
 ## Design goal
 
-This is inspired by the budget-awareness idea in Google's `budget-aware-agent`, but intentionally does not port its search/browse budget machinery. DeepSeek Harness already owns pressure measurement and compaction policy; this plugin only surfaces the remaining pre-compaction budget to the model.
+This is inspired by the budget-awareness idea in Google's `budget-aware-agent`, but intentionally does not port its search/browse budget machinery. DeepSeek Harness already owns pressure measurement and compaction policy; this plugin surfaces the remaining pre-compaction budget and, when configured, only clarifies how that field should be interpreted.
 
 ## License
 
