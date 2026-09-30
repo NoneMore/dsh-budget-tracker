@@ -40,13 +40,16 @@ test('only requires the host-level agent registry service', () => {
   assert.deepEqual(inject, ['agents'])
 })
 
-test('exports a schemastery Config for the Web-editable prompt mode', () => {
-  assert.equal(typeof Config, 'function')
+test('exports a volatile schemastery Config for the Web-editable prompt mode', () => {
+  const defaults = Config({})
+  const behavioral = Config({ promptMode: 'behavioral' })
+  assert.equal(defaults.promptMode.get(), DEFAULT_PROMPT_MODE)
+  assert.equal(behavioral.promptMode.get(), 'behavioral')
 })
 
 test('reads direct and volatile prompt mode values', () => {
   assert.equal(currentPromptMode({ promptMode: 'planning' }), 'planning')
-  assert.equal(currentPromptMode({ promptMode: { get: () => 'behavioral' } }), 'behavioral')
+  assert.equal(currentPromptMode(Config({ promptMode: 'behavioral' })), 'behavioral')
   assert.equal(currentPromptMode(), DEFAULT_PROMPT_MODE)
 })
 
