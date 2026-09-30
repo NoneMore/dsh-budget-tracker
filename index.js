@@ -142,14 +142,12 @@ function serviceForAgent(ctx, agent, serviceName) {
   const agentCtx = agent?.ctx
   if (!agentCtx) return undefined
 
-  const presets = ctx.get?.('agentPresets') ?? ctx.agentPresets
+  const presets = ctx.get?.('agentPresets')
   const scoped = presets?.serviceFor?.(agent, serviceName)
   if (scoped !== undefined) return scoped
 
   return agentCtx.get?.(serviceName)
-    ?? agentCtx[serviceName]
     ?? ctx.get?.(serviceName)
-    ?? ctx[serviceName]
 }
 
 /** Resolve the model-visible remaining budget after downstream pre-step work. */
