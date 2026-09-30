@@ -1,3 +1,4 @@
+import z from '@deepseek-ai/schemastery'
 import { randomUUID } from 'node:crypto'
 
 export const name = 'dsh-budget-tracker'
@@ -6,6 +7,14 @@ export const PROMPT_MODES = Object.freeze(['none', 'semantic', 'planning', 'beha
 export const DEFAULT_PROMPT_MODE = 'semantic'
 export const PROMPT_SECTION_NAME = 'budget-tracker:context-remaining-guidance'
 export const PROMPT_SECTION_ORDER = 9800
+
+/**
+ * Runtime Config schema. The field is volatile so the Web settings surface can
+ * edit it without turning prompt selection into a separate persistence system.
+ */
+export const Config = z.object({
+  promptMode: z.union([...PROMPT_MODES]).default(DEFAULT_PROMPT_MODE).volatile(),
+})
 
 const PROMPT_TEXT = Object.freeze({
   semantic: 'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder.',
@@ -32,18 +41,35 @@ export function resolvePromptText(mode = DEFAULT_PROMPT_MODE) {
   )
 }
 
-/** Register the configured static explanation without changing snapshot semantics. */
-function registerPrompt(ctx, mode) {
-  const text = resolvePromptText(mode)
-  if (text === undefined) return
+/** Resolve a direct test/config value or a Schemastery volatile reference. */
+export function currentPromptMode(config = {}) {
+  const configured = config?.promptMode
+  if (configured && typeof configured === 'object' && typeof configured.get === 'function') {
+    return configured.get()
+  }
+  return configured ?? DEFAULT_PROMPT_MODE
+}
 
+/**
+ * Register one stable system-prompt section whose text reads the current
+ * volatile setting at assembly time. `none` therefore renders an empty
+ * section without requiring a plugin reload.
+ */
+function registerPrompt(ctx, config) {
   ctx.inject(['systemPrompt'], (inner) => {
     inner.effect(() => inner.systemPrompt.section({
       name: PROMPT_SECTION_NAME,
       order: PROMPT_SECTION_ORDER,
-      text,
+      text: () => resolvePromptText(currentPromptMode(config)) ?? '',
       interpolate: false,
     }), 'dsh-budget-tracker system prompt')
+  })
+}
+
+/** Tell Settings that this plugin ships its own Web configuration page. */
+function registerSettingsPresentation(ctx) {
+  ctx.inject(['settings'], (child) => {
+    child.effect(() => child.settings.configure({ auto: false }, ctx.fiber))
   })
 }
 // The tracker intentionally follows dsh-compaction-basic's pressure semantics:
@@ -248,7 +274,8 @@ async function contextRemainingText(ctx, agent, signal) {
  * before the model-visible budget snapshot is measured.
  */
 export function apply(ctx, config = {}) {
-  registerPrompt(ctx, config?.promptMode ?? DEFAULT_PROMPT_MODE)
+  registerPrompt(ctx, config)
+  registerSettingsPresentation(ctx)
 
   return ctx.on('agent/pre-step', async (
     { agent, signal },

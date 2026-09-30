@@ -12,7 +12,7 @@ No search budget, browse budget, HIGH/MEDIUM/LOW policy, replanning, or threshol
 
 ## Compatibility
 
-Version 0.2.3 targets DeepSeek Harness 0.2.x starting with
+Version 0.3.0 targets DeepSeek Harness 0.2.x starting with
 `dsh-v0.2.0-rc.2`.
 
 ```text
@@ -119,6 +119,14 @@ config:
 ```
 
 Unknown mode values fail plugin activation instead of silently selecting a policy. No mode changes the budget calculation or compaction policy. Even `behavioral` defines no numeric thresholds, search/browse budgets, or hard tool restrictions.
+
+## Configure from the Web Plugins page
+
+On DeepSeek Harness Web, the bundle ships a browser-side configuration page for the `budget-tracker` row. Open **Plugins**, open the installed `dsh-budget-tracker` bundle, then choose **Configure** on the `budget-tracker` row.
+
+The page presents all four prompt modes as selectable options and writes `promptMode` through Harness Settings/config-editor. Changes therefore persist in the active profile configuration instead of being stored separately by this plugin. **Reset to inherited** removes the profile override and restores the value supplied by the lower configuration layer; with the bundled patch, that inherited value is `semantic`.
+
+Only `promptMode` is exposed as a volatile Web-editable field. The budget calculation itself remains read-only and continues to derive from the active compaction policy.
 
 ## Dynamic context
 
