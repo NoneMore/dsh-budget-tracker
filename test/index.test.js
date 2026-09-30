@@ -102,6 +102,8 @@ function integrationHarness({
   scopedCompaction = true,
   hostCompaction = false,
   hasAgentPresets = true,
+  hasLlm = true,
+  hasTokenMeter = true,
 } = {}) {
   let currentTokens = beforeTokens
   let listener
@@ -157,8 +159,8 @@ function integrationHarness({
         },
       },
     } : {}),
-    llm,
-    tokenMeter,
+    ...(hasLlm ? { llm } : {}),
+    ...(hasTokenMeter ? { tokenMeter } : {}),
     ...(hostCompaction ? { compaction } : {}),
   }
 
@@ -249,6 +251,18 @@ test('emits no budget when the agent has no active compaction service', async ()
     scopedCompaction: false,
     hostCompaction: false,
   })
+  const decision = await harness.run()
+  assert.deepEqual(decision, { kind: 'enter', messages: [] })
+})
+
+test('emits no budget when the LLM service is unavailable', async () => {
+  const harness = integrationHarness({ hasLlm: false })
+  const decision = await harness.run()
+  assert.deepEqual(decision, { kind: 'enter', messages: [] })
+})
+
+test('emits no budget when the token meter service is unavailable', async () => {
+  const harness = integrationHarness({ hasTokenMeter: false })
   const decision = await harness.run()
   assert.deepEqual(decision, { kind: 'enter', messages: [] })
 })
