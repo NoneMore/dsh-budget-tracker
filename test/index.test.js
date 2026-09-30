@@ -101,6 +101,7 @@ function integrationHarness({
   retainedText,
   scopedCompaction = true,
   hostCompaction = false,
+  hasAgentPresets = true,
 } = {}) {
   let currentTokens = beforeTokens
   let listener
@@ -146,27 +147,42 @@ function integrationHarness({
   // context can inherit host services such as llm/tokenMeter, but it cannot
   // directly resolve that isolated compaction service.
   const hostServices = {
-    agentPresets: {
-      serviceFor: (agent, serviceName) => {
-        serviceLookups.push({ agent, serviceName })
-        return scopedCompaction && serviceName === 'compaction'
-          ? compaction
-          : undefined
+    ...(hasAgentPresets ? {
+      agentPresets: {
+        serviceFor: (agent, serviceName) => {
+          serviceLookups.push({ agent, serviceName })
+          return scopedCompaction && serviceName === 'compaction'
+            ? compaction
+            : undefined
+        },
       },
-    },
+    } : {}),
     llm,
     tokenMeter,
     ...(hostCompaction ? { compaction } : {}),
   }
-  const agentCtx = {
+
+  // Cordis contexts reject undeclared service property access. Keep the harness
+  // strict so optional services must be read through ctx.get(), just like the
+  // real runtime.
+  const strictContext = api => new Proxy(api, {
+    get(target, property, receiver) {
+      if (typeof property === 'string' && !(property in target)) {
+        throw new Error(`undeclared context property access: ${property}`)
+      }
+      return Reflect.get(target, property, receiver)
+    },
+  })
+
+  const agentCtx = strictContext({
     get: serviceName => (
       serviceName === 'compaction' && !hostCompaction
         ? undefined
         : hostServices[serviceName]
     ),
-  }
+  })
 
-  const ctx = {
+  const ctx = strictContext({
     get: serviceName => hostServices[serviceName],
     on: (name, callback, listenerOptions) => {
       assert.equal(name, 'agent/pre-step')
@@ -174,7 +190,7 @@ function integrationHarness({
       options = listenerOptions
       return () => true
     },
-  }
+  })
 
   apply(ctx)
   return {
@@ -213,6 +229,16 @@ test('falls back to a host-visible compaction service outside preset isolation',
   const harness = integrationHarness({
     scopedCompaction: false,
     hostCompaction: true,
+  })
+  const decision = await harness.run()
+  assert.equal(decision.messages[0].content[0].text, 'context_remaining: 500000')
+})
+
+test('falls back to host services when no preset registry is installed', async () => {
+  const harness = integrationHarness({
+    scopedCompaction: false,
+    hostCompaction: true,
+    hasAgentPresets: false,
   })
   const decision = await harness.run()
   assert.equal(decision.messages[0].content[0].text, 'context_remaining: 500000')
