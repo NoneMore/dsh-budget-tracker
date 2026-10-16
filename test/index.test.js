@@ -8,8 +8,13 @@ import {
   DEFAULT_PROMPT_MODE,
   PROMPT_SECTION_NAME,
   PROMPT_SECTION_ORDER,
+  ADAPTIVE_POLICY_SOURCE,
+  ADAPTIVE_POLICY_SECTION_NAME,
+  ADAPTIVE_BAND_RATIOS,
   currentPromptMode,
   resolvePromptText,
+  resolveAdaptivePolicyText,
+  resolveAdaptiveBand,
   calculateContextRemaining,
   calculateThresholdTokens,
   resolvePressurePolicy,
@@ -43,13 +48,16 @@ test('only requires the host-level agent registry service', () => {
 test('exports a volatile schemastery Config for the Web-editable prompt mode', () => {
   const defaults = Config({})
   const behavioral = Config({ promptMode: 'behavioral' })
+  const adaptive = Config({ promptMode: 'adaptive' })
   assert.equal(defaults.promptMode.get(), DEFAULT_PROMPT_MODE)
   assert.equal(behavioral.promptMode.get(), 'behavioral')
+  assert.equal(adaptive.promptMode.get(), 'adaptive')
 })
 
 test('reads direct and volatile prompt mode values', () => {
   assert.equal(currentPromptMode({ promptMode: 'planning' }), 'planning')
   assert.equal(currentPromptMode(Config({ promptMode: 'behavioral' })), 'behavioral')
+  assert.equal(currentPromptMode(Config({ promptMode: 'adaptive' })), 'adaptive')
   assert.equal(currentPromptMode(), DEFAULT_PROMPT_MODE)
 })
 
@@ -75,6 +83,10 @@ test('behavioral mode guides context-conserving behavior', () => {
   )
 })
 
+test('adaptive mode uses planning as its static system-prompt baseline', () => {
+  assert.equal(resolvePromptText('adaptive'), resolvePromptText('planning'))
+})
+
 test('none mode disables static prompt guidance', () => {
   assert.equal(resolvePromptText('none'), undefined)
 })
@@ -82,7 +94,7 @@ test('none mode disables static prompt guidance', () => {
 test('rejects unknown prompt modes', () => {
   assert.throws(
     () => resolvePromptText('aggressive'),
-    /promptMode must be one of none, semantic, planning, behavioral/,
+    /promptMode must be one of none, semantic, planning, behavioral, adaptive/,
   )
 })
 
@@ -152,6 +164,24 @@ test('rejects invalid threshold inputs instead of inventing a budget', () => {
   assert.equal(calculateContextRemaining(undefined, 1), undefined)
 })
 
+test('adaptive bands use relative remaining budget with inclusive boundaries', () => {
+  assert.deepEqual(ADAPTIVE_BAND_RATIOS, { conserve: 0.25, critical: 0.10 })
+  assert.equal(resolveAdaptiveBand(800_000, 800_000), 'ample')
+  assert.equal(resolveAdaptiveBand(200_001, 800_000), 'ample')
+  assert.equal(resolveAdaptiveBand(200_000, 800_000), 'conserve')
+  assert.equal(resolveAdaptiveBand(80_001, 800_000), 'conserve')
+  assert.equal(resolveAdaptiveBand(80_000, 800_000), 'critical')
+  assert.equal(resolveAdaptiveBand(0, 800_000), 'critical')
+})
+
+test('adaptive band resolution rejects invalid inputs', () => {
+  assert.equal(resolveAdaptiveBand(undefined, 800_000), undefined)
+  assert.equal(resolveAdaptiveBand(1, undefined), undefined)
+  assert.equal(resolveAdaptiveBand(1, 0), undefined)
+  assert.equal(resolveAdaptiveBand(-1, 800_000), undefined)
+  assert.equal(resolveAdaptiveBand(800_001, 800_000), undefined)
+})
+
 function integrationHarness({
   beforeTokens = 810_000,
   afterTokens = 300_000,
@@ -160,6 +190,7 @@ function integrationHarness({
   headerMaxTokens = 32_768,
   auto = true,
   retainedText,
+  retainedPolicyText,
   scopedCompaction = true,
   hostCompaction = false,
   hasAgentPresets = true,
@@ -175,12 +206,20 @@ function integrationHarness({
   let settingsConfigurePolicy
   const serviceLookups = []
 
-  const retained = retainedText === undefined
-    ? []
-    : [{ type: 'user/message', data: {
-      content: [{ type: 'text', text: retainedText }],
-      source: { kind: 'dsh-budget-tracker' },
-    } }]
+  const retained = [
+    ...(retainedText === undefined
+      ? []
+      : [{ type: 'user/message', data: {
+        content: [{ type: 'text', text: retainedText }],
+        source: { kind: 'dsh-budget-tracker' },
+      } }]),
+    ...(retainedPolicyText === undefined
+      ? []
+      : [{ type: 'user/message', data: {
+        content: [{ type: 'text', text: retainedPolicyText }],
+        source: { kind: ADAPTIVE_POLICY_SOURCE },
+      } }]),
+  ]
 
   const session = {
     surface: { nodes: retained.map((_, index) => index) },
@@ -278,8 +317,8 @@ function integrationHarness({
       throw new Error('unexpected injected services: ' + services.join(','))
     },
     fiber: { id: 'budget-tracker-fiber' },
-    on: (name, callback, listenerOptions) => {
-      assert.equal(name, 'agent/pre-step')
+    on: (eventName, callback, listenerOptions) => {
+      assert.equal(eventName, 'agent/pre-step')
       listener = callback
       options = listenerOptions
       return () => true
@@ -334,6 +373,12 @@ test('registers behavioral guidance when configured', () => {
   const harness = integrationHarness({ promptMode: 'behavioral' })
   assert.equal(harness.promptInjectCalls, 1)
   assert.equal(harness.promptSection.text(), resolvePromptText('behavioral'))
+})
+
+test('registers planning baseline when adaptive is configured', () => {
+  const harness = integrationHarness({ promptMode: 'adaptive' })
+  assert.equal(harness.promptInjectCalls, 1)
+  assert.equal(harness.promptSection.text(), resolvePromptText('planning'))
 })
 
 test('none prompt mode renders an empty static section', () => {
@@ -433,6 +478,119 @@ test('falls back to the adapter default completion reservation when the header o
 
 test('does not duplicate an unchanged retained budget snapshot', async () => {
   const harness = integrationHarness({ retainedText: 'context_remaining: 500000' })
+  const decision = await harness.run()
+  assert.deepEqual(decision, { kind: 'enter', messages: [] })
+})
+
+test('adaptive ample pressure stays silent beyond the normal budget snapshot', async () => {
+  const harness = integrationHarness({ promptMode: 'adaptive' })
+  const decision = await harness.run()
+  assert.equal(decision.messages.length, 1)
+  assert.equal(decision.messages[0].content[0].text, 'context_remaining: 500000')
+})
+
+test('adaptive conserve pressure emits one separate policy snapshot from post-compaction state', async () => {
+  const harness = integrationHarness({
+    promptMode: 'adaptive',
+    afterTokens: 650_000,
+  })
+  const decision = await harness.run()
+  assert.equal(decision.messages.length, 2)
+  assert.equal(decision.messages[0].content[0].text, 'context_remaining: 150000')
+  assert.equal(decision.messages[1].content[0].text, resolveAdaptivePolicyText('conserve'))
+  assert.equal(decision.messages[1].source.kind, ADAPTIVE_POLICY_SOURCE)
+  assert.equal(decision.messages[1].source.form, 'snapshot')
+  assert.deepEqual(decision.messages[1].source.sections, [{
+    name: ADAPTIVE_POLICY_SECTION_NAME,
+    text: resolveAdaptivePolicyText('conserve'),
+  }])
+})
+
+test('adaptive critical pressure emits stronger guidance', async () => {
+  const harness = integrationHarness({
+    promptMode: 'adaptive',
+    afterTokens: 730_000,
+  })
+  const decision = await harness.run()
+  assert.equal(decision.messages[0].content[0].text, 'context_remaining: 70000')
+  assert.equal(decision.messages[1].content[0].text, resolveAdaptivePolicyText('critical'))
+})
+
+test('adaptive does not repeat a retained policy when the band is unchanged', async () => {
+  const harness = integrationHarness({
+    promptMode: 'adaptive',
+    afterTokens: 650_000,
+    retainedText: 'context_remaining: 150000',
+    retainedPolicyText: resolveAdaptivePolicyText('conserve'),
+  })
+  const decision = await harness.run()
+  assert.deepEqual(decision, { kind: 'enter', messages: [] })
+})
+
+test('adaptive publishes a new policy on any band transition', async () => {
+  const harness = integrationHarness({
+    promptMode: 'adaptive',
+    afterTokens: 650_000,
+    retainedText: 'context_remaining: 70000',
+    retainedPolicyText: resolveAdaptivePolicyText('critical'),
+  })
+  const decision = await harness.run()
+  assert.equal(decision.messages.length, 2)
+  assert.equal(decision.messages[0].content[0].text, 'context_remaining: 150000')
+  assert.equal(decision.messages[1].content[0].text, resolveAdaptivePolicyText('conserve'))
+})
+
+test('adaptive emits one relaxation snapshot when pressure returns to ample', async () => {
+  const harness = integrationHarness({
+    promptMode: 'adaptive',
+    retainedPolicyText: resolveAdaptivePolicyText('critical'),
+  })
+  const decision = await harness.run()
+  assert.equal(decision.messages.length, 2)
+  assert.equal(decision.messages[0].content[0].text, 'context_remaining: 500000')
+  assert.equal(decision.messages[1].content[0].text, resolveAdaptivePolicyText('ample'))
+})
+
+test('adaptive does not repeat an already retained relaxation snapshot', async () => {
+  const harness = integrationHarness({
+    promptMode: 'adaptive',
+    retainedText: 'context_remaining: 500000',
+    retainedPolicyText: resolveAdaptivePolicyText('ample'),
+  })
+  const decision = await harness.run()
+  assert.deepEqual(decision, { kind: 'enter', messages: [] })
+})
+
+test('adaptive republishes restrictive guidance when no policy snapshot survives', async () => {
+  const harness = integrationHarness({
+    promptMode: 'adaptive',
+    afterTokens: 730_000,
+    retainedText: 'context_remaining: 70000',
+  })
+  const decision = await harness.run()
+  assert.equal(decision.messages.length, 1)
+  assert.equal(decision.messages[0].content[0].text, resolveAdaptivePolicyText('critical'))
+  assert.equal(decision.messages[0].source.kind, ADAPTIVE_POLICY_SOURCE)
+})
+
+test('switching away from adaptive clears retained restrictive guidance', async () => {
+  const harness = integrationHarness({
+    promptMode: 'planning',
+    retainedText: 'context_remaining: 500000',
+    retainedPolicyText: resolveAdaptivePolicyText('critical'),
+  })
+  const decision = await harness.run()
+  assert.equal(decision.messages.length, 1)
+  assert.equal(decision.messages[0].content[0].text, resolveAdaptivePolicyText('ample'))
+  assert.equal(decision.messages[0].source.kind, ADAPTIVE_POLICY_SOURCE)
+})
+
+test('unavailable adaptive pressure does not invent a policy transition', async () => {
+  const harness = integrationHarness({
+    promptMode: 'adaptive',
+    hasLlm: false,
+    retainedPolicyText: resolveAdaptivePolicyText('critical'),
+  })
   const decision = await harness.run()
   assert.deepEqual(decision, { kind: 'enter', messages: [] })
 })
