@@ -3,10 +3,19 @@ import { randomUUID } from 'node:crypto'
 
 export const name = 'dsh-budget-tracker'
 
-export const PROMPT_MODES = Object.freeze(['none', 'semantic', 'planning', 'behavioral'])
+export const PROMPT_MODES = Object.freeze(['none', 'semantic', 'planning', 'behavioral', 'adaptive'])
 export const DEFAULT_PROMPT_MODE = 'semantic'
 export const PROMPT_SECTION_NAME = 'budget-tracker:context-remaining-guidance'
 export const PROMPT_SECTION_ORDER = 9800
+export const ADAPTIVE_POLICY_SOURCE = 'dsh-budget-tracker-policy'
+export const ADAPTIVE_POLICY_SECTION_NAME = 'budget-tracker:adaptive-guidance'
+
+// Experimental implementation policy. These cutoffs are intentionally not
+// exposed as runtime/Web configuration or part of context_remaining semantics.
+export const ADAPTIVE_BAND_RATIOS = Object.freeze({
+  conserve: 0.25,
+  critical: 0.10,
+})
 
 /**
  * Runtime Config schema. The field is volatile so the Web settings surface can
@@ -16,10 +25,22 @@ export const Config = z.object({
   promptMode: z.union([...PROMPT_MODES]).default(DEFAULT_PROMPT_MODE).volatile(),
 })
 
+const SEMANTIC_PROMPT_TEXT = 'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder.'
+const PLANNING_PROMPT_TEXT = `${SEMANTIC_PROMPT_TEXT} Use it as a context-pressure signal when deciding how much context to spend on the current response.`
+
 const PROMPT_TEXT = Object.freeze({
-  semantic: 'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder.',
-  planning: 'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder. Use it as a context-pressure signal when deciding how much context to spend on the current response.',
-  behavioral: 'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder. Use it as a context-pressure signal when deciding how much context to spend on the current response. As the remaining budget decreases, actively limit avoidable context growth: prioritize essential information, avoid unnecessary restatement, keep intermediate outputs compact, and prefer completing the current task over opening large new lines of work. Do not invent numeric thresholds or treat the value as a hard limit.',
+  semantic: SEMANTIC_PROMPT_TEXT,
+  planning: PLANNING_PROMPT_TEXT,
+  behavioral: `${PLANNING_PROMPT_TEXT} As the remaining budget decreases, actively limit avoidable context growth: prioritize essential information, avoid unnecessary restatement, keep intermediate outputs compact, and prefer completing the current task over opening large new lines of work. Do not invent numeric thresholds or treat the value as a hard limit.`,
+  // Adaptive uses planning as its stable system-prompt baseline. Sparse
+  // post-compaction policy snapshots provide the pressure-specific behavior.
+  adaptive: PLANNING_PROMPT_TEXT,
+})
+
+const ADAPTIVE_POLICY_TEXT = Object.freeze({
+  ample: 'Context pressure has eased. Earlier adaptive context-conservation guidance no longer applies; use the planning baseline normally.',
+  conserve: 'Updated context-conservation guidance: reduce avoidable context growth. Avoid redundant restatement and low-value exploration, keep intermediate outputs and tool-result handling compact, and prefer advancing the current task. Necessary verification and exploration for correctness remain appropriate. This supersedes earlier adaptive context-conservation guidance.',
+  critical: 'Updated context-conservation guidance: context pressure is severe. Do only the work needed to finish the current task or reach a safe checkpoint. Avoid large new workstreams and nonessential exploration; prioritize finish, verify, and report. This supersedes earlier adaptive context-conservation guidance.',
 })
 
 /**
@@ -27,7 +48,8 @@ const PROMPT_TEXT = Object.freeze({
  *
  * `semantic` only disambiguates the field. `planning` adds lightweight usage
  * guidance. `behavioral` additionally guides context-conserving behavior without
- * inventing thresholds or changing compaction policy.
+ * inventing thresholds or changing compaction policy. `adaptive` keeps the
+ * `planning` baseline and adds sparse dynamic policy snapshots after pre-step.
  *
  * @param {string | undefined} mode
  * @returns {string | undefined}
@@ -39,6 +61,11 @@ export function resolvePromptText(mode = DEFAULT_PROMPT_MODE) {
   throw new TypeError(
     'dsh-budget-tracker: promptMode must be one of ' + PROMPT_MODES.join(', '),
   )
+}
+
+/** Resolve one model-facing adaptive policy text. */
+export function resolveAdaptivePolicyText(band) {
+  return ADAPTIVE_POLICY_TEXT[band]
 }
 
 /** Resolve a direct test/config value or a Schemastery volatile reference. */
@@ -169,11 +196,35 @@ export function calculateContextRemaining(thresholdTokens, currentPressureTokens
   return Math.max(0, Math.floor(thresholdTokens - currentPressureTokens))
 }
 
-/** Build one immutable source-attributed context message without runtime deps. */
-function createBudgetMessage(text) {
-  const section = Object.freeze({ name: 'budget-tracker:context-remaining', text })
+/**
+ * Resolve the adaptive pressure band from the relative remaining budget.
+ *
+ * The cutoffs are implementation policy, not user configuration and not part
+ * of the meaning of context_remaining.
+ *
+ * @param {number | undefined} contextRemaining
+ * @param {number | undefined} thresholdTokens
+ * @returns {'ample' | 'conserve' | 'critical' | undefined}
+ */
+export function resolveAdaptiveBand(contextRemaining, thresholdTokens) {
+  if (!Number.isInteger(contextRemaining) || !Number.isInteger(thresholdTokens)) {
+    return undefined
+  }
+  if (thresholdTokens <= 0 || contextRemaining < 0 || contextRemaining > thresholdTokens) {
+    return undefined
+  }
+
+  const remainingRatio = contextRemaining / thresholdTokens
+  if (remainingRatio <= ADAPTIVE_BAND_RATIOS.critical) return 'critical'
+  if (remainingRatio <= ADAPTIVE_BAND_RATIOS.conserve) return 'conserve'
+  return 'ample'
+}
+
+/** Build one immutable source-attributed snapshot message without runtime deps. */
+function createSnapshotMessage(sourceKind, sectionName, text) {
+  const section = Object.freeze({ name: sectionName, text })
   const source = Object.freeze({
-    kind: name,
+    kind: sourceKind,
     form: 'snapshot',
     sections: Object.freeze([section]),
   })
@@ -185,19 +236,69 @@ function createBudgetMessage(text) {
   })
 }
 
-/** Return the newest retained budget snapshot text, if one survives. */
-function retainedBudgetText(session) {
+function createBudgetMessage(text) {
+  return createSnapshotMessage(name, 'budget-tracker:context-remaining', text)
+}
+
+function createAdaptivePolicyMessage(text) {
+  return createSnapshotMessage(
+    ADAPTIVE_POLICY_SOURCE,
+    ADAPTIVE_POLICY_SECTION_NAME,
+    text,
+  )
+}
+
+/** Return the newest retained single-text snapshot from one producer. */
+function retainedSnapshotText(session, sourceKind) {
   const nodes = session?.surface?.nodes
   if (!nodes || typeof session.eventAt !== 'function') return undefined
   for (let index = nodes.length - 1; index >= 0; index -= 1) {
     const event = session.eventAt(nodes[index])
-    if (event?.type !== 'user/message' || event.data?.source?.kind !== name) continue
+    if (event?.type !== 'user/message' || event.data?.source?.kind !== sourceKind) continue
     const [block] = event.data.content ?? []
     return event.data.content?.length === 1 && block?.type === 'text'
       ? block.text
       : undefined
   }
   return undefined
+}
+
+/** Return the newest retained budget snapshot text, if one survives. */
+function retainedBudgetText(session) {
+  return retainedSnapshotText(session, name)
+}
+
+/** Return the newest retained adaptive-policy snapshot text, if one survives. */
+function retainedAdaptivePolicyText(session) {
+  return retainedSnapshotText(session, ADAPTIVE_POLICY_SOURCE)
+}
+
+/**
+ * Decide whether the model-visible adaptive policy needs a new snapshot.
+ *
+ * An ample band is silent when no policy is retained. When a restrictive
+ * policy is retained, ample emits one relaxation snapshot to supersede it.
+ * Switching away from adaptive follows the same clearing rule. Restrictive
+ * bands are re-published whenever their matching snapshot no longer survives.
+ */
+function adaptivePolicyUpdateText(promptMode, band, retainedText) {
+  if (promptMode !== 'adaptive') {
+    if (retainedText === undefined || retainedText === ADAPTIVE_POLICY_TEXT.ample) {
+      return undefined
+    }
+    return ADAPTIVE_POLICY_TEXT.ample
+  }
+
+  if (band === undefined) return undefined
+  if (band === 'ample') {
+    if (retainedText === undefined || retainedText === ADAPTIVE_POLICY_TEXT.ample) {
+      return undefined
+    }
+    return ADAPTIVE_POLICY_TEXT.ample
+  }
+
+  const desired = ADAPTIVE_POLICY_TEXT[band]
+  return retainedText === desired ? undefined : desired
 }
 
 /**
@@ -220,8 +321,8 @@ function serviceForAgent(ctx, agent, serviceName) {
     ?? ctx.get?.(serviceName)
 }
 
-/** Resolve the model-visible remaining budget after downstream pre-step work. */
-async function contextRemainingText(ctx, agent, signal) {
+/** Resolve the post-downstream budget state used by both model-visible outputs. */
+async function resolveBudgetState(ctx, agent, signal) {
   const compaction = serviceForAgent(ctx, agent, 'compaction')
   const llm = serviceForAgent(ctx, agent, 'llm')
   const tokenMeter = serviceForAgent(ctx, agent, 'tokenMeter')
@@ -263,7 +364,13 @@ async function contextRemainingText(ctx, agent, signal) {
   // performed by downstream pre-step listeners is already reflected here.
   const currentPressureTokens = tokenMeter.measure(agent.session).totalTokens
   const remaining = calculateContextRemaining(thresholdTokens, currentPressureTokens)
-  return remaining === undefined ? undefined : `context_remaining: ${remaining}`
+  if (remaining === undefined) return undefined
+
+  return {
+    thresholdTokens,
+    remaining,
+    text: `context_remaining: ${remaining}`,
+  }
 }
 
 /**
@@ -271,7 +378,7 @@ async function contextRemainingText(ctx, agent, signal) {
  *
  * The prepended listener wraps the complete pre-step chain. It computes after
  * next(), so any dsh-compaction-basic pruning/compaction in that chain lands
- * before the model-visible budget snapshot is measured.
+ * before the model-visible budget snapshot and adaptive policy are resolved.
  */
 export function apply(ctx, config = {}) {
   registerPrompt(ctx, config)
@@ -281,16 +388,35 @@ export function apply(ctx, config = {}) {
     { agent, signal },
     next,
   ) => {
+    // Capture the mode at listener entry so the static prompt assembled just
+    // before pre-step and the dynamic policy decision use one configuration.
+    const promptMode = currentPromptMode(config)
     const decision = await next()
     if (decision.kind === 'reject' || signal?.aborted) return decision
 
-    const text = await contextRemainingText(ctx, agent, signal)
-    if (text === undefined || signal?.aborted) return decision
-    if (retainedBudgetText(agent.session) === text) return decision
+    const retainedPolicy = retainedAdaptivePolicyText(agent.session)
+    let policyText = adaptivePolicyUpdateText(promptMode, undefined, retainedPolicy)
+
+    const budget = await resolveBudgetState(ctx, agent, signal)
+    if (signal?.aborted) return decision
+
+    if (promptMode === 'adaptive' && budget !== undefined) {
+      const band = resolveAdaptiveBand(budget.remaining, budget.thresholdTokens)
+      policyText = adaptivePolicyUpdateText(promptMode, band, retainedPolicy)
+    }
+
+    const additions = []
+    if (budget !== undefined && retainedBudgetText(agent.session) !== budget.text) {
+      additions.push(createBudgetMessage(budget.text))
+    }
+    if (policyText !== undefined) {
+      additions.push(createAdaptivePolicyMessage(policyText))
+    }
+    if (additions.length === 0) return decision
 
     return {
       ...decision,
-      messages: [...decision.messages, createBudgetMessage(text)],
+      messages: [...decision.messages, ...additions],
     }
   }, { prepend: true })
 }
