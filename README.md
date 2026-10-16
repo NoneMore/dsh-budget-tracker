@@ -8,7 +8,7 @@ It exposes exactly one model-visible budget field:
 context_remaining: 190000
 ```
 
-No search budget, browse budget, HIGH/MEDIUM/LOW policy, replanning, or threshold policy is added. An optional static system-prompt hint can explain how to interpret the field; it never changes the budget calculation.
+No search budget, browse budget, or second model-visible pressure field is added. Optional prompt modes can explain the field, guide planning, or opt into an internal relative-pressure policy. None of them changes the budget calculation or Harness compaction policy.
 
 ## Compatibility
 
@@ -90,7 +90,9 @@ On DSH Web, presets that enable compaction (including the shipped `standard`, `p
 
 The tracker installs a prepended `agent/pre-step` wrapper and computes only after `next()` returns. This means any downstream pruning or proactive compaction has already completed before `context_remaining` is measured and injected into the request. A step that compacts therefore sees the **post-compaction** remaining budget, not the stale value that triggered compaction.
 
-The first request of a fresh session has no prior durable route, so the plugin emits nothing. It also emits nothing when:
+Adaptive policy resolution uses this same post-compaction measurement. The model therefore never receives a pressure-specific adaptive instruction selected from the stale pre-compaction state alongside a newer `context_remaining` value.
+
+The first request of a fresh session has no prior durable route, so the plugin emits nothing. It also emits no budget when:
 
 - no active compaction service is available for the agent;
 - automatic compaction is disabled with `auto: false`;
@@ -102,13 +104,14 @@ It does not fall back to the model's absolute context-window remainder, because 
 
 ## Prompt modes
 
-The dynamic budget snapshot and the static system-prompt explanation are deliberately separate. Configure `promptMode` on the plugin row:
+The dynamic budget snapshot and prompt guidance are deliberately separate. Configure `promptMode` on the plugin row:
 
-| Mode | Static system-prompt behavior |
+| Mode | Behavior |
 | --- | --- |
-| `semantic` | **Default.** Explains that `context_remaining` is the budget before proactive compaction, not the model's absolute context-window remainder. |
+| `semantic` | **Default.** Static system prompt explaining that `context_remaining` is the budget before proactive compaction, not the model's absolute context-window remainder. |
 | `planning` | Includes the semantic explanation and asks the model to use the value as a context-pressure signal when deciding how much context to spend on the current response. |
-| `behavioral` | Builds on `planning` and actively guides context-conserving behavior as the budget decreases: prioritize essentials, avoid unnecessary restatement, keep intermediate outputs compact, and prefer finishing current work over opening large new lines of work. It still defines no numeric thresholds. |
+| `behavioral` | Builds on `planning` and statically guides context-conserving behavior as the budget decreases: prioritize essentials, avoid unnecessary restatement, keep intermediate outputs compact, and prefer finishing current work over opening large new lines of work. It still defines no numeric thresholds. |
+| `adaptive` | Uses the same static baseline as `planning`, then adds sparse post-compaction policy snapshots when the internally resolved relative-pressure band changes. |
 | `none` | Adds no static prompt guidance, matching the pre-prompt behavior of the plugin. |
 
 The bundled patch defaults to:
@@ -118,25 +121,62 @@ config:
   promptMode: semantic
 ```
 
-Unknown mode values fail plugin activation instead of silently selecting a policy. No mode changes the budget calculation or compaction policy. Even `behavioral` defines no numeric thresholds, search/browse budgets, or hard tool restrictions.
+Unknown mode values fail plugin activation instead of silently selecting a policy. No mode changes the budget calculation or compaction policy, and no mode adds hard tool restrictions.
+
+### Adaptive pressure policy
+
+`adaptive` is intentionally opt-in. It derives an internal relative remaining value from the same post-compaction budget state:
+
+```text
+remaining_ratio = context_remaining / thresholdTokens
+```
+
+The current experimental implementation policy has three bands:
+
+| Band | Current cutoff | Intended behavior |
+| --- | ---: | --- |
+| `ample` | `remaining_ratio > 0.25` | No extra adaptive guidance. The `planning` baseline remains active and useful exploration is allowed. |
+| `conserve` | `0.10 < remaining_ratio <= 0.25` | Reduce avoidable context growth, redundant restatement, and low-value exploration; keep intermediate/tool-result handling compact. Necessary verification and exploration for correctness remain appropriate. |
+| `critical` | `remaining_ratio <= 0.10` | Do only the work needed to finish the current task or reach a safe checkpoint; avoid large new workstreams and nonessential exploration; prioritize finish, verify, and report. |
+
+These cutoffs are **implementation policy**, not configuration and not part of the meaning of `context_remaining`. They are expected to be evaluated against long sessions and may change without adding a new model-visible field.
+
+Adaptive guidance is transition-driven rather than injected on every step. The plugin keeps two independent source-attributed snapshot streams:
+
+```text
+dsh-budget-tracker         -> context_remaining budget state
+dsh-budget-tracker-policy  -> current adaptive guidance state
+```
+
+The budget snapshot continues to update whenever its value changes. Adaptive guidance is emitted only when the model-visible policy needs updating:
+
+- entering `conserve` or `critical` publishes the corresponding guidance once;
+- any transition between restrictive bands publishes the new guidance once;
+- returning to `ample` publishes one relaxation snapshot only when older restrictive adaptive guidance is still retained;
+- if compaction removes the active restrictive policy snapshot while the session remains in that band, the next step republishes it;
+- switching away from `adaptive` similarly publishes one relaxation snapshot when needed so stale adaptive restrictions do not remain active.
+
+There is no hysteresis and no special handling for why the ratio changed. The current post-compaction band is authoritative.
 
 ## Configure from the Web Plugins page
 
 On DeepSeek Harness Web, the bundle ships a browser-side configuration page for the `budget-tracker` row. Open **Plugins**, open the installed `dsh-budget-tracker` bundle, then choose **Configure** on the `budget-tracker` row.
 
-The page presents all four prompt modes as selectable options and writes `promptMode` through Harness Settings/config-editor. Changes therefore persist in the active profile configuration instead of being stored separately by this plugin. **Reset to inherited** removes the profile override and restores the value supplied by the lower configuration layer; with the bundled patch, that inherited value is `semantic`.
+The page presents all five prompt modes as selectable options and writes `promptMode` through Harness Settings/config-editor. Changes therefore persist in the active profile configuration instead of being stored separately by this plugin. **Reset to inherited** removes the profile override and restores the value supplied by the lower configuration layer; with the bundled patch, that inherited value is `semantic`.
 
-Only `promptMode` is exposed as a volatile Web-editable field. The budget calculation itself remains read-only and continues to derive from the active compaction policy.
+Only `promptMode` is exposed as a volatile Web-editable field. The adaptive ratio cutoffs and the budget calculation remain read-only implementation policy.
 
 ## Dynamic context
 
-The value is added as a source-attributed snapshot context message after the pre-step chain settles. If the same retained value is already present, the plugin does not add a duplicate snapshot.
+The budget value is added as a source-attributed snapshot context message after the pre-step chain settles. If the same retained value is already present, the plugin does not add a duplicate snapshot.
 
-The dynamic model-visible snapshot remains exactly one field:
+The dynamic model-visible budget snapshot remains exactly one field:
 
 ```text
 context_remaining: <tokens>
 ```
+
+Adaptive mode never adds a second budget field such as `pressure_level`. Its separate policy snapshot contains natural-language guidance selected internally from the relative band.
 
 This plugin intentionally targets `dsh-compaction-basic` and expects the active `compaction` service to expose its resolved pressure-policy configuration.
 
@@ -172,7 +212,7 @@ npm test
 
 ## Design goal
 
-This is inspired by the budget-awareness idea in Google's `budget-aware-agent`, but intentionally does not port its search/browse budget machinery. DeepSeek Harness already owns pressure measurement and compaction policy; this plugin surfaces the remaining pre-compaction budget and optionally adds progressively stronger guidance for interpreting and acting on that signal.
+This is inspired by the budget-awareness idea in Google's `budget-aware-agent`, but intentionally does not port its search/browse budget machinery. DeepSeek Harness already owns pressure measurement and compaction policy; this plugin surfaces the remaining pre-compaction budget and can optionally apply a small, relative, transition-driven control policy without changing that underlying compaction behavior.
 
 ## License
 
