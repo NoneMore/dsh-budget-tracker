@@ -138,7 +138,9 @@ context_remaining: 98694
 context_remaining: 98694 / 284819 (34.7%)
 ```
 
-The exact unrounded ratio is used internally for adaptive band selection. Display rounding never feeds control decisions. Raw and normalized representations use the same static prompt for a given non-`none` `promptMode`; that prompt conditionally defines the normalized `R / B (P%)` notation without making representation itself part of the prompt treatment.
+The exact unrounded ratio is used internally for adaptive band selection. Display rounding never feeds control decisions. Raw and normalized representations use the same static prompt for a given non-`none` `promptMode`; that prompt conditionally defines the normalized `R / B (P%)` notation without making representation itself part of the prompt treatment. `raw` preserves only the historical model-visible representation: this PR intentionally changes that shared non-`none` prompt baseline, so a raw run is not behaviorally identical to a pre-#11 default run.
+
+`normalized` is a bundled relative-pressure treatment: it exposes the denominator, relative fraction/percentage, and a longer redundant representation together. A comparative improvement therefore supports the broader claim that explicit relative-pressure representation improves salience; it does not isolate the percentage component by itself.
 
 Experiment observation is intentionally kept out of the runtime plugin. Comparative analysis can be performed later from complete canonical Harness session logs with external tooling rather than introducing a second plugin-owned trace format here.
 
