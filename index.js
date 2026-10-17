@@ -38,7 +38,7 @@ const PROMPT_TEXT = Object.freeze({
 })
 
 const ADAPTIVE_POLICY_TEXT = Object.freeze({
-  ample: 'Context pressure has eased. Earlier adaptive context-conservation guidance no longer applies; use the planning baseline normally.',
+  ample: 'Earlier adaptive context-conservation guidance no longer applies. Follow the currently active system guidance.',
   conserve: 'Updated context-conservation guidance: reduce avoidable context growth. Avoid redundant restatement and low-value exploration, keep intermediate outputs and tool-result handling compact, and prefer advancing the current task. Necessary verification and exploration for correctness remain appropriate. This supersedes earlier adaptive context-conservation guidance.',
   critical: 'Updated context-conservation guidance: context pressure is severe. Do only the work needed to finish the current task or reach a safe checkpoint. Avoid large new workstreams and nonessential exploration; prioritize finish, verify, and report. This supersedes earlier adaptive context-conservation guidance.',
 })
