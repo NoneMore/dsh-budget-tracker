@@ -142,6 +142,8 @@ function integrationHarness({
   headerMaxTokens = 32_768,
   auto = true,
   retainedText,
+  retainedPolicyText,
+  supportsAdmissionContextRefresh = true,
   scopedCompaction = true,
   hostCompaction = false,
   hasAgentPresets = true,
@@ -159,12 +161,20 @@ function integrationHarness({
   let settingsConfigurePolicy
   const serviceLookups = []
 
-  const retained = retainedText === undefined
-    ? []
-    : [{ type: 'user/message', data: {
-      content: [{ type: 'text', text: retainedText }],
-      source: { kind: 'dsh-budget-tracker' },
-    } }]
+  const retained = [
+    ...(retainedText === undefined
+      ? []
+      : [{ type: 'user/message', data: {
+        content: [{ type: 'text', text: retainedText }],
+        source: { kind: 'dsh-budget-tracker' },
+      } }]),
+    ...(retainedPolicyText === undefined
+      ? []
+      : [{ type: 'user/message', data: {
+        content: [{ type: 'text', text: retainedPolicyText }],
+        source: { kind: 'dsh-budget-tracker-policy' },
+      } }]),
+  ]
 
   const session = {
     surface: { nodes: retained.map((_, index) => index) },
@@ -233,18 +243,20 @@ function integrationHarness({
     inject: (services, callback) => {
       if (services.length === 1 && services[0] === 'systemPrompt') {
         promptInjectCalls += 1
+        const systemPromptApi = {
+          section: section => {
+            promptSection = section
+            return () => true
+          },
+          context: context => {
+            policyContext = context
+            return () => true
+          },
+          ...(supportsAdmissionContextRefresh ? { refreshContext: () => undefined } : {}),
+        }
         return callback(strictContext({
           effect: factory => factory(),
-          systemPrompt: strictContext({
-            section: section => {
-              promptSection = section
-              return () => true
-            },
-            context: context => {
-              policyContext = context
-              return () => true
-            },
-          }),
+          systemPrompt: strictContext(systemPromptApi),
         }))
       }
       if (services.length === 1 && services[0] === 'settings') {
@@ -277,7 +289,8 @@ function integrationHarness({
     policyContext,
     promptInjectCalls,
     settingsConfigurePolicy,
-    policyText: () => policyContext.text({ agent }),
+    hasPolicyContext: () => policyContext !== undefined,
+    policyText: () => policyContext?.text({ agent }) ?? '',
     setAfterTokens: value => { downstreamTokens = value },
     run: async ({ reject = false } = {}) => listener(
       { agent, signal: new AbortController().signal },
@@ -320,6 +333,15 @@ test('registers static prompt and required adaptive runtime context together', (
     },
   )
   assert.equal(harness.policyText(), '')
+})
+
+test('rc.2 capability detection skips native adaptive context', () => {
+  const harness = integrationHarness({
+    promptMode: 'adaptive',
+    supportsAdmissionContextRefresh: false,
+  })
+  assert.equal(harness.hasPolicyContext(), false)
+  assert.equal(harness.promptSection.text(), resolvePromptText('planning'))
 })
 
 test('marks the settings form as plugin-owned instead of auto-generated', () => {
@@ -443,6 +465,41 @@ test('non-adaptive mode and unavailable budget clear adaptive runtime contributi
   const unavailable = integrationHarness({ promptMode: 'adaptive', hasLlm: false })
   await unavailable.run()
   assert.equal(unavailable.policyText(), '')
+})
+
+test('rc.2 fallback emits sparse post-compaction policy snapshots', async () => {
+  const harness = integrationHarness({
+    promptMode: 'adaptive',
+    afterTokens: 650_000,
+    supportsAdmissionContextRefresh: false,
+  })
+  const decision = await harness.run()
+  assert.equal(decision.messages.length, 2)
+  assert.equal(decision.messages[0].content[0].text, 'context_remaining: 150000')
+  assert.equal(decision.messages[1].source.kind, 'dsh-budget-tracker-policy')
+  assert.match(decision.messages[1].content[0].text, /reduce avoidable context growth/)
+})
+
+test('rc.2 fallback clears a retained restrictive policy when pressure returns to ample', async () => {
+  const harness = integrationHarness({
+    promptMode: 'adaptive',
+    retainedPolicyText: 'Updated context-conservation guidance: context pressure is severe. Do only the work needed to finish the current task or reach a safe checkpoint. Avoid large new workstreams and nonessential exploration; prioritize finish, verify, and report. This supersedes earlier adaptive context-conservation guidance.',
+    supportsAdmissionContextRefresh: false,
+  })
+  const decision = await harness.run()
+  assert.equal(decision.messages.at(-1).source.kind, 'dsh-budget-tracker-policy')
+  assert.match(decision.messages.at(-1).content[0].text, /no longer applies/)
+})
+
+test('native path clears a retained legacy restriction once during migration', async () => {
+  const harness = integrationHarness({
+    promptMode: 'adaptive',
+    retainedPolicyText: 'legacy restrictive policy',
+  })
+  const decision = await harness.run()
+  assert.equal(decision.messages.at(-1).source.kind, 'dsh-budget-tracker-policy')
+  assert.match(decision.messages.at(-1).content[0].text, /no longer applies/)
+  assert.equal(harness.policyText(), '')
 })
 
 test('does not mutate policy state for a rejected pre-step', async () => {

@@ -28,7 +28,9 @@ bundle a second DSH copy.
 The APIs this plugin relies on — `agent/pre-step`, the token meter,
 `requestHeader()`, routed model metadata, `systemPrompt.context()`, and
 `dsh-compaction-basic` pressure resolution — are available in the supported
-Harness line.
+Harness line. Admission-time runtime-context refresh is newer than
+`dsh-v0.2.0-rc.2`, so the plugin detects that capability at runtime and keeps a
+compatibility fallback for rc.2.
 
 ## What `context_remaining` means
 
@@ -89,7 +91,9 @@ On DSH Web, presets that enable compaction (including the shipped `standard`, `p
 
 The tracker installs a prepended `agent/pre-step` wrapper and computes only after `next()` returns. This means any downstream pruning or proactive compaction has already completed before `context_remaining` and the adaptive band are measured. A step that compacts therefore sees the **post-compaction** remaining budget, not the stale value that triggered compaction.
 
-Adaptive guidance is contributed through Harness `systemPrompt.context()`. Harness refreshes registered runtime context after pre-step, so the guidance used for request admission is derived from the same post-compaction state as the budget snapshot.
+On Harness builds that expose admission-time `systemPrompt.refreshContext()`, adaptive guidance is contributed through `systemPrompt.context()`. Harness refreshes that registered context after pre-step, so the guidance used for request admission is derived from the same post-compaction state as the budget snapshot.
+
+`dsh-v0.2.0-rc.2` already has `systemPrompt.context()`, but assembles runtime context before `agent/pre-step` and cannot refresh it during admission. On that runtime the plugin deliberately does **not** register the adaptive context provider; it falls back to the sparse source-attributed policy snapshots used by the original adaptive implementation so the same-step post-compaction semantics remain correct.
 
 The first request of a fresh session has no prior durable route, so the plugin emits no budget. It also emits no budget when:
 
@@ -156,7 +160,7 @@ The plugin requires:
 
 Invalid ordering fails plugin activation rather than silently selecting a fallback policy.
 
-Adaptive state is not stored as a second plugin-owned conversation protocol. The tracker keeps only the current per-agent guidance in process memory and exposes it as a required Harness runtime-context contribution:
+On refresh-capable Harness builds, adaptive state is not stored as a second plugin-owned conversation protocol. The tracker keeps only the current per-agent guidance in process memory and exposes it as a required Harness runtime-context contribution:
 
 ```text
 budget-tracker:adaptive-guidance
@@ -169,17 +173,19 @@ Harness evaluates that provider again during admission refresh after pre-step. T
 - the critical guidance in `critical`;
 - empty when adaptive mode is disabled or the current budget cannot be resolved.
 
-Harness owns replacement of older runtime-context snapshots, so the plugin does not emit neutral "relaxation" messages or scan retained conversation history to decide which policy is active.
+Harness owns replacement of older runtime-context snapshots on this path, so the plugin does not emit neutral "relaxation" messages or scan retained policy history.
 
-There is no hysteresis or cooldown. The exact current post-compaction ratio is authoritative. If compaction moves the ratio from `critical` back to `ample`, the adaptive contribution becomes empty on that same request's admission refresh.
+For `dsh-v0.2.0-rc.2`, where admission refresh is unavailable, the plugin keeps a narrowly isolated compatibility path using the legacy `dsh-budget-tracker-policy` snapshot stream. That fallback emits only on policy transitions, uses a neutral relaxation snapshot to supersede a retained restrictive policy, and is skipped entirely once native admission refresh is available. If a session upgrades from the fallback path to a refresh-capable Harness, the plugin emits one neutral legacy snapshot to clear any retained old restriction before relying on native runtime context.
+
+There is no hysteresis or cooldown on either path. The exact current post-compaction ratio is authoritative. A compaction that moves the ratio from `critical` back to `ample` relaxes policy for that same model request.
 
 ## Cache and context-growth behavior
 
 `context_remaining` remains an independent, very small source-attributed snapshot because its numeric value changes frequently. Moving that high-frequency value into Harness's complete runtime-context snapshot would cause unrelated runtime-context text to be repeated whenever the number changes.
 
-Adaptive policy is different: it changes only when the resolved band changes, so it is a good fit for `systemPrompt.context()`. Harness treats runtime context as cache-safe derived history and appends a changed current snapshot after retained history rather than rewriting the stable system-prompt prefix.
+Adaptive policy is different: it changes only when the resolved band changes, so on refresh-capable Harness builds it is a good fit for `systemPrompt.context()`. Harness treats runtime context as cache-safe derived history and appends a changed current snapshot after retained history rather than rewriting the stable system-prompt prefix.
 
-This keeps the high-frequency budget update cheap while avoiding a plugin-owned policy-message state machine.
+On rc.2 the compatibility fallback retains the original sparse policy-message cache shape. This keeps the high-frequency budget update cheap on all supported runtimes while using native runtime context wherever Harness can refresh it from post-compaction state.
 
 ## Configure from the Web Plugins page
 
