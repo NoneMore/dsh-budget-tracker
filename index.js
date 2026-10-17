@@ -10,19 +10,29 @@ export const PROMPT_SECTION_ORDER = 9800
 export const ADAPTIVE_POLICY_SOURCE = 'dsh-budget-tracker-policy'
 export const ADAPTIVE_POLICY_SECTION_NAME = 'budget-tracker:adaptive-guidance'
 
-// Experimental implementation policy. These cutoffs are intentionally not
-// exposed as runtime/Web configuration or part of context_remaining semantics.
+// Experimental defaults. They remain model-invisible and are not exposed by
+// the Web configuration surface, but can be overridden in runtime/profile
+// config so controlled experiments do not require rebuilding the plugin.
 export const ADAPTIVE_BAND_RATIOS = Object.freeze({
   conserve: 0.25,
   critical: 0.10,
 })
+export const DEFAULT_ADAPTIVE_POLICY = Object.freeze({
+  conserveRatio: ADAPTIVE_BAND_RATIOS.conserve,
+  criticalRatio: ADAPTIVE_BAND_RATIOS.critical,
+})
 
 /**
- * Runtime Config schema. The field is volatile so the Web settings surface can
- * edit it without turning prompt selection into a separate persistence system.
+ * Runtime Config schema. Only promptMode is volatile/Web-editable. Adaptive
+ * cutoffs are hidden experiment controls and intentionally require ordinary
+ * profile/runtime configuration rather than hot Web mutation.
  */
 export const Config = z.object({
   promptMode: z.union([...PROMPT_MODES]).default(DEFAULT_PROMPT_MODE).volatile(),
+  adaptivePolicy: z.object({
+    conserveRatio: z.number().min(0).max(1).default(DEFAULT_ADAPTIVE_POLICY.conserveRatio),
+    criticalRatio: z.number().min(0).max(1).default(DEFAULT_ADAPTIVE_POLICY.criticalRatio),
+  }).default({}),
 })
 
 const SEMANTIC_PROMPT_TEXT = 'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder.'
@@ -78,6 +88,29 @@ export function currentPromptMode(config = {}) {
 }
 
 /**
+ * Resolve and validate the hidden adaptive experiment controls.
+ *
+ * Cross-field ordering is validated here because Schemastery validates fields
+ * independently. Invalid policy config is an activation error rather than a
+ * silent fallback that would contaminate an experiment.
+ */
+export function resolveAdaptivePolicyConfig(config = {}) {
+  const configured = config?.adaptivePolicy ?? {}
+  const conserveRatio = configured.conserveRatio ?? DEFAULT_ADAPTIVE_POLICY.conserveRatio
+  const criticalRatio = configured.criticalRatio ?? DEFAULT_ADAPTIVE_POLICY.criticalRatio
+
+  if (!Number.isFinite(conserveRatio) || !Number.isFinite(criticalRatio)
+    || criticalRatio <= 0 || conserveRatio >= 1
+    || criticalRatio >= conserveRatio) {
+    throw new TypeError(
+      'dsh-budget-tracker: adaptivePolicy must satisfy 0 < criticalRatio < conserveRatio < 1',
+    )
+  }
+
+  return Object.freeze({ conserveRatio, criticalRatio })
+}
+
+/**
  * Register one stable system-prompt section whose text reads the current
  * volatile setting at assembly time. `none` therefore renders an empty
  * section without requiring a plugin reload.
@@ -99,6 +132,7 @@ function registerSettingsPresentation(ctx) {
     child.effect(() => child.settings.configure({ auto: false }, ctx.fiber))
   })
 }
+
 // The tracker intentionally follows dsh-compaction-basic's pressure semantics:
 // the active compaction service for its resolved policy, the LLM service for
 // the current routed model capacity, and tokenMeter for the exact pressure
@@ -199,14 +233,20 @@ export function calculateContextRemaining(thresholdTokens, currentPressureTokens
 /**
  * Resolve the adaptive pressure band from the relative remaining budget.
  *
- * The cutoffs are implementation policy, not user configuration and not part
- * of the meaning of context_remaining.
+ * The cutoffs are hidden runtime experiment policy, not part of the meaning of
+ * context_remaining. The exact current ratio is authoritative; no hysteresis
+ * or transition-specific threshold logic is applied.
  *
  * @param {number | undefined} contextRemaining
  * @param {number | undefined} thresholdTokens
+ * @param {{ conserveRatio: number, criticalRatio: number }} adaptivePolicy
  * @returns {'ample' | 'conserve' | 'critical' | undefined}
  */
-export function resolveAdaptiveBand(contextRemaining, thresholdTokens) {
+export function resolveAdaptiveBand(
+  contextRemaining,
+  thresholdTokens,
+  adaptivePolicy = DEFAULT_ADAPTIVE_POLICY,
+) {
   if (!Number.isInteger(contextRemaining) || !Number.isInteger(thresholdTokens)) {
     return undefined
   }
@@ -215,8 +255,8 @@ export function resolveAdaptiveBand(contextRemaining, thresholdTokens) {
   }
 
   const remainingRatio = contextRemaining / thresholdTokens
-  if (remainingRatio <= ADAPTIVE_BAND_RATIOS.critical) return 'critical'
-  if (remainingRatio <= ADAPTIVE_BAND_RATIOS.conserve) return 'conserve'
+  if (remainingRatio <= adaptivePolicy.criticalRatio) return 'critical'
+  if (remainingRatio <= adaptivePolicy.conserveRatio) return 'conserve'
   return 'ample'
 }
 
@@ -381,6 +421,7 @@ async function resolveBudgetState(ctx, agent, signal) {
  * before the model-visible budget snapshot and adaptive policy are resolved.
  */
 export function apply(ctx, config = {}) {
+  const adaptivePolicy = resolveAdaptivePolicyConfig(config)
   registerPrompt(ctx, config)
   registerSettingsPresentation(ctx)
 
@@ -401,7 +442,11 @@ export function apply(ctx, config = {}) {
     if (signal?.aborted) return decision
 
     if (promptMode === 'adaptive' && budget !== undefined) {
-      const band = resolveAdaptiveBand(budget.remaining, budget.thresholdTokens)
+      const band = resolveAdaptiveBand(
+        budget.remaining,
+        budget.thresholdTokens,
+        adaptivePolicy,
+      )
       policyText = adaptivePolicyUpdateText(promptMode, band, retainedPolicy)
     }
 

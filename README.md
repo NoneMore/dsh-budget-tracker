@@ -131,15 +131,31 @@ Unknown mode values fail plugin activation instead of silently selecting a polic
 remaining_ratio = context_remaining / thresholdTokens
 ```
 
-The current experimental implementation policy has three bands:
+The current experimental defaults have three bands:
 
-| Band | Current cutoff | Intended behavior |
+| Band | Default cutoff | Intended behavior |
 | --- | ---: | --- |
 | `ample` | `remaining_ratio > 0.25` | No extra adaptive guidance. The `planning` baseline remains active and useful exploration is allowed. |
 | `conserve` | `0.10 < remaining_ratio <= 0.25` | Reduce avoidable context growth, redundant restatement, and low-value exploration; keep intermediate/tool-result handling compact. Necessary verification and exploration for correctness remain appropriate. |
 | `critical` | `remaining_ratio <= 0.10` | Do only the work needed to finish the current task or reach a safe checkpoint; avoid large new workstreams and nonessential exploration; prioritize finish, verify, and report. |
 
-These cutoffs are **implementation policy**, not configuration and not part of the meaning of `context_remaining`. They are expected to be evaluated against long sessions and may change without adding a new model-visible field.
+The cutoffs are control-policy experiment inputs, not part of the meaning of `context_remaining`. They are deliberately hidden from the Web configuration surface and are non-volatile, so an experiment can pin them for a run without making them ordinary user-facing knobs. They can be overridden in runtime/profile configuration:
+
+```yaml
+config:
+  promptMode: adaptive
+  adaptivePolicy:
+    conserveRatio: 0.25
+    criticalRatio: 0.10
+```
+
+The plugin requires:
+
+```text
+0 < criticalRatio < conserveRatio < 1
+```
+
+Invalid ordering fails plugin activation rather than silently selecting a fallback policy.
 
 Adaptive guidance is transition-driven rather than injected on every step. The plugin keeps two independent source-attributed snapshot streams:
 
@@ -152,11 +168,11 @@ The budget snapshot continues to update whenever its value changes. Adaptive gui
 
 - entering `conserve` or `critical` publishes the corresponding guidance once;
 - any transition between restrictive bands publishes the new guidance once;
-- returning to `ample` publishes one relaxation snapshot only when older restrictive adaptive guidance is still retained;
+- returning to `ample` publishes one neutral relaxation snapshot only when older restrictive adaptive guidance is still retained;
 - if compaction removes the active restrictive policy snapshot while the session remains in that band, the next step republishes it;
-- switching away from `adaptive` similarly publishes one relaxation snapshot when needed so stale adaptive restrictions do not remain active.
+- switching away from `adaptive` similarly publishes one neutral relaxation snapshot when needed so stale adaptive restrictions do not remain active.
 
-There is no hysteresis and no special handling for why the ratio changed. The current post-compaction band is authoritative.
+There is no hysteresis and no special handling for why the ratio changed. The exact current post-compaction ratio is authoritative.
 
 ## Configure from the Web Plugins page
 
@@ -164,7 +180,7 @@ On DeepSeek Harness Web, the bundle ships a browser-side configuration page for 
 
 The page presents all five prompt modes as selectable options and writes `promptMode` through Harness Settings/config-editor. Changes therefore persist in the active profile configuration instead of being stored separately by this plugin. **Reset to inherited** removes the profile override and restores the value supplied by the lower configuration layer; with the bundled patch, that inherited value is `semantic`.
 
-Only `promptMode` is exposed as a volatile Web-editable field. The adaptive ratio cutoffs and the budget calculation remain read-only implementation policy.
+Only `promptMode` is exposed as a volatile Web-editable field. Adaptive thresholds are hidden non-volatile experiment controls; the budget calculation itself remains read-only and continues to derive from the active compaction policy.
 
 ## Dynamic context
 
@@ -176,7 +192,7 @@ The dynamic model-visible budget snapshot remains exactly one field:
 context_remaining: <tokens>
 ```
 
-Adaptive mode never adds a second budget field such as `pressure_level`. Its separate policy snapshot contains natural-language guidance selected internally from the relative band.
+Adaptive mode never adds a second budget field such as `pressure_level`. Its separate policy snapshot contains natural-language guidance selected internally from the relative band; the band name itself remains model-invisible.
 
 This plugin intentionally targets `dsh-compaction-basic` and expects the active `compaction` service to expose its resolved pressure-policy configuration.
 
