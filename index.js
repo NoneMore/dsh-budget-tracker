@@ -9,8 +9,6 @@ export const PROMPT_SECTION_NAME = 'budget-tracker:context-remaining-guidance'
 export const PROMPT_SECTION_ORDER = 9800
 export const ADAPTIVE_POLICY_CONTEXT_NAME = 'budget-tracker:adaptive-guidance'
 export const ADAPTIVE_POLICY_CONTEXT_ORDER = 9800
-const LEGACY_ADAPTIVE_POLICY_SOURCE = 'dsh-budget-tracker-policy'
-const LEGACY_ADAPTIVE_POLICY_SECTION_NAME = 'budget-tracker:adaptive-guidance'
 
 // Experimental defaults. They remain model-invisible and are not exposed by
 // the Web configuration surface, but can be overridden in runtime/profile
@@ -53,12 +51,6 @@ const ADAPTIVE_POLICY_TEXT = Object.freeze({
   ample: '',
   conserve: 'Adaptive context-conservation guidance: reduce avoidable context growth. Avoid redundant restatement and low-value exploration, keep intermediate outputs and tool-result handling compact, and prefer advancing the current task. Necessary verification and exploration for correctness remain appropriate.',
   critical: 'Adaptive context-conservation guidance: context pressure is severe. Do only the work needed to finish the current task or reach a safe checkpoint. Avoid large new workstreams and nonessential exploration; prioritize finish, verify, and report.',
-})
-
-const LEGACY_ADAPTIVE_POLICY_TEXT = Object.freeze({
-  ample: 'Earlier adaptive context-conservation guidance no longer applies. Follow the currently active system guidance.',
-  conserve: 'Updated context-conservation guidance: reduce avoidable context growth. Avoid redundant restatement and low-value exploration, keep intermediate outputs and tool-result handling compact, and prefer advancing the current task. Necessary verification and exploration for correctness remain appropriate. This supersedes earlier adaptive context-conservation guidance.',
-  critical: 'Updated context-conservation guidance: context pressure is severe. Do only the work needed to finish the current task or reach a safe checkpoint. Avoid large new workstreams and nonessential exploration; prioritize finish, verify, and report. This supersedes earlier adaptive context-conservation guidance.',
 })
 
 /**
@@ -118,15 +110,17 @@ export function resolveAdaptivePolicyConfig(config = {}) {
   return Object.freeze({ conserveRatio, criticalRatio })
 }
 
+function adaptiveRuntimeUnavailable() {
+  return new TypeError(
+    'dsh-budget-tracker: adaptive promptMode requires admission-time systemPrompt.refreshContext()',
+  )
+}
+
 /**
- * Register the stable system-prompt guidance and, when supported by the active
- * Harness, admission-refreshed adaptive runtime context.
- *
- * dsh-v0.2.0-rc.2 already exposes systemPrompt.context(), but assembles that
- * context before agent/pre-step and has no refreshContext() admission refresh.
- * Registering adaptive policy there would therefore lag post-compaction state
- * by one step. Capability detection keeps rc.2 on the legacy sparse snapshot
- * fallback while newer Harness builds use the native cache-safe context path.
+ * Register stable system-prompt guidance and, on capable Harness builds, the
+ * admission-refreshed adaptive runtime context. Older runtimes remain supported
+ * for non-adaptive prompt modes; adaptive mode is rejected instead of falling
+ * back to a plugin-owned policy-message protocol.
  */
 function registerPrompt(ctx, config, adaptiveGuidanceByAgent, runtimeCapabilities) {
   ctx.inject(['systemPrompt'], (inner) => {
@@ -141,14 +135,16 @@ function registerPrompt(ctx, config, adaptiveGuidanceByAgent, runtimeCapabilitie
       'refreshContext' in inner.systemPrompt
       && typeof inner.systemPrompt.refreshContext === 'function'
 
-    if (!runtimeCapabilities.admissionContextRefresh) return
+    if (!runtimeCapabilities.admissionContextRefresh) {
+      if (currentPromptMode(config) === 'adaptive') throw adaptiveRuntimeUnavailable()
+      return
+    }
 
     inner.effect(() => inner.systemPrompt.context({
       name: ADAPTIVE_POLICY_CONTEXT_NAME,
       order: ADAPTIVE_POLICY_CONTEXT_ORDER,
       text: context => adaptiveGuidanceByAgent.get(context?.agent) ?? '',
       interpolate: false,
-      required: true,
     }), 'dsh-budget-tracker adaptive runtime context')
   })
 }
@@ -303,66 +299,19 @@ function createBudgetMessage(text) {
   })
 }
 
-/** Return the newest retained single-text snapshot from one producer. */
-function retainedSnapshotText(session, sourceKind) {
+/** Return the newest retained budget snapshot text, if one survives. */
+function retainedBudgetText(session) {
   const nodes = session?.surface?.nodes
   if (!nodes || typeof session.eventAt !== 'function') return undefined
   for (let index = nodes.length - 1; index >= 0; index -= 1) {
     const event = session.eventAt(nodes[index])
-    if (event?.type !== 'user/message' || event.data?.source?.kind !== sourceKind) continue
+    if (event?.type !== 'user/message' || event.data?.source?.kind !== name) continue
     const [block] = event.data.content ?? []
     return event.data.content?.length === 1 && block?.type === 'text'
       ? block.text
       : undefined
   }
   return undefined
-}
-
-/** Return the newest retained budget snapshot text, if one survives. */
-function retainedBudgetText(session) {
-  return retainedSnapshotText(session, name)
-}
-
-/** Return the newest retained legacy adaptive-policy snapshot, if one survives. */
-function retainedLegacyAdaptivePolicyText(session) {
-  return retainedSnapshotText(session, LEGACY_ADAPTIVE_POLICY_SOURCE)
-}
-
-/** Build one legacy policy message for Harness versions without admission refresh. */
-function createLegacyAdaptivePolicyMessage(text) {
-  const section = Object.freeze({ name: LEGACY_ADAPTIVE_POLICY_SECTION_NAME, text })
-  const source = Object.freeze({
-    kind: LEGACY_ADAPTIVE_POLICY_SOURCE,
-    form: 'snapshot',
-    sections: Object.freeze([section]),
-  })
-  return Object.freeze({
-    id: randomUUID(),
-    role: 'user',
-    content: Object.freeze([Object.freeze({ type: 'text', text })]),
-    source,
-  })
-}
-
-/**
- * Decide the sparse legacy policy update needed on Harness versions whose
- * runtime context is assembled before pre-step and cannot refresh at admission.
- */
-function legacyAdaptivePolicyUpdateText(promptMode, band, retainedText) {
-  if (promptMode !== 'adaptive') {
-    if (retainedText === undefined || retainedText === LEGACY_ADAPTIVE_POLICY_TEXT.ample) {
-      return undefined
-    }
-    return LEGACY_ADAPTIVE_POLICY_TEXT.ample
-  }
-
-  if (band === undefined) return undefined
-  const desired = LEGACY_ADAPTIVE_POLICY_TEXT[band]
-  if (band === 'ample') {
-    if (retainedText === undefined || retainedText === desired) return undefined
-    return desired
-  }
-  return retainedText === desired ? undefined : desired
 }
 
 /**
@@ -447,7 +396,7 @@ async function resolveBudgetState(ctx, agent, signal) {
 export function apply(ctx, config = {}) {
   const adaptivePolicy = resolveAdaptivePolicyConfig(config)
   const adaptiveGuidanceByAgent = new WeakMap()
-  const runtimeCapabilities = { admissionContextRefresh: false }
+  const runtimeCapabilities = { admissionContextRefresh: undefined }
   registerPrompt(ctx, config, adaptiveGuidanceByAgent, runtimeCapabilities)
   registerSettingsPresentation(ctx)
 
@@ -458,6 +407,10 @@ export function apply(ctx, config = {}) {
     // Capture the mode at listener entry so the static prompt assembled just
     // before pre-step and the dynamic policy decision use one configuration.
     const promptMode = currentPromptMode(config)
+    if (promptMode === 'adaptive' && runtimeCapabilities.admissionContextRefresh !== true) {
+      throw adaptiveRuntimeUnavailable()
+    }
+
     const decision = await next()
     if (decision.kind === 'reject' || signal?.aborted) return decision
 
@@ -468,36 +421,15 @@ export function apply(ctx, config = {}) {
       ? resolveAdaptiveBand(budget.remaining, budget.thresholdTokens, adaptivePolicy)
       : undefined
 
-    const additions = []
-    if (budget !== undefined && retainedBudgetText(agent.session) !== budget.text) {
-      additions.push(createBudgetMessage(budget.text))
+    adaptiveGuidanceByAgent.set(agent, resolveAdaptivePolicyText(band) ?? '')
+
+    if (budget === undefined || retainedBudgetText(agent.session) === budget.text) {
+      return decision
     }
 
-    const retainedLegacyPolicy = retainedLegacyAdaptivePolicyText(agent.session)
-    if (runtimeCapabilities.admissionContextRefresh) {
-      adaptiveGuidanceByAgent.set(agent, resolveAdaptivePolicyText(band) ?? '')
-      // A session may have been created by an older plugin/runtime combination.
-      // Clear a retained legacy restriction once after switching to native context.
-      if (retainedLegacyPolicy !== undefined
-        && retainedLegacyPolicy !== LEGACY_ADAPTIVE_POLICY_TEXT.ample) {
-        additions.push(createLegacyAdaptivePolicyMessage(LEGACY_ADAPTIVE_POLICY_TEXT.ample))
-      }
-    } else {
-      adaptiveGuidanceByAgent.delete(agent)
-      const policyText = legacyAdaptivePolicyUpdateText(
-        promptMode,
-        band,
-        retainedLegacyPolicy,
-      )
-      if (policyText !== undefined) {
-        additions.push(createLegacyAdaptivePolicyMessage(policyText))
-      }
-    }
-
-    if (additions.length === 0) return decision
     return {
       ...decision,
-      messages: [...decision.messages, ...additions],
+      messages: [...decision.messages, createBudgetMessage(budget.text)],
     }
   }, { prepend: true })
 }
