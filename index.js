@@ -9,6 +9,9 @@ export const PROMPT_SECTION_NAME = 'budget-tracker:context-remaining-guidance'
 export const PROMPT_SECTION_ORDER = 9800
 export const ADAPTIVE_POLICY_CONTEXT_NAME = 'budget-tracker:adaptive-guidance'
 export const ADAPTIVE_POLICY_CONTEXT_ORDER = 9800
+export const BUDGET_REPRESENTATIONS = Object.freeze(['raw', 'normalized'])
+export const DEFAULT_BUDGET_REPRESENTATION = 'raw'
+export const BUDGET_PERCENT_PRECISION = 1
 
 // Experimental defaults. They remain model-invisible and are not exposed by
 // the Web configuration surface, but can be overridden in runtime/profile
@@ -23,19 +26,21 @@ export const DEFAULT_ADAPTIVE_POLICY = Object.freeze({
 })
 
 /**
- * Runtime Config schema. Only promptMode is volatile/Web-editable. Adaptive
- * cutoffs are hidden experiment controls and intentionally require ordinary
+ * Runtime Config schema. Only promptMode is volatile/Web-editable.
+ * Representation and adaptive cutoffs are hidden controls that require ordinary
  * profile/runtime configuration rather than hot Web mutation.
  */
 export const Config = z.object({
   promptMode: z.union([...PROMPT_MODES]).default(DEFAULT_PROMPT_MODE).volatile(),
+  budgetRepresentation: z.union([...BUDGET_REPRESENTATIONS])
+    .default(DEFAULT_BUDGET_REPRESENTATION),
   adaptivePolicy: z.object({
     conserveRatio: z.number().min(0).max(1).default(DEFAULT_ADAPTIVE_POLICY.conserveRatio),
     criticalRatio: z.number().min(0).max(1).default(DEFAULT_ADAPTIVE_POLICY.criticalRatio),
   }).default({}),
 })
 
-const SEMANTIC_PROMPT_TEXT = 'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder.'
+const SEMANTIC_PROMPT_TEXT = 'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder. When shown as R / B (P%), B is the current proactive-compaction budget and P = R/B.'
 const PLANNING_PROMPT_TEXT = `${SEMANTIC_PROMPT_TEXT} Use it as a context-pressure signal when deciding how much context to spend on the current response.`
 
 const PROMPT_TEXT = Object.freeze({
@@ -85,6 +90,17 @@ export function currentPromptMode(config = {}) {
     return configured.get()
   }
   return configured ?? DEFAULT_PROMPT_MODE
+}
+
+/** Resolve the hidden, non-volatile model-visible budget representation. */
+export function resolveBudgetRepresentation(config = {}) {
+  const representation = config?.budgetRepresentation ?? DEFAULT_BUDGET_REPRESENTATION
+  if (!BUDGET_REPRESENTATIONS.includes(representation)) {
+    throw new TypeError(
+      'dsh-budget-tracker: budgetRepresentation must be one of ' + BUDGET_REPRESENTATIONS.join(', '),
+    )
+  }
+  return representation
 }
 
 /**
@@ -253,6 +269,31 @@ export function calculateContextRemaining(thresholdTokens, currentPressureTokens
   return Math.max(0, Math.floor(thresholdTokens - currentPressureTokens))
 }
 
+export function formatBudgetText(
+  contextRemaining,
+  thresholdTokens,
+  representation = DEFAULT_BUDGET_REPRESENTATION,
+) {
+  if (!Number.isInteger(contextRemaining) || !Number.isInteger(thresholdTokens)) {
+    return undefined
+  }
+  if (thresholdTokens <= 0 || contextRemaining < 0 || contextRemaining > thresholdTokens) {
+    return undefined
+  }
+
+  if (representation === 'raw') {
+    return `context_remaining: ${contextRemaining}`
+  }
+  if (representation === 'normalized') {
+    const percent = ((contextRemaining / thresholdTokens) * 100)
+      .toFixed(BUDGET_PERCENT_PRECISION)
+    return `context_remaining: ${contextRemaining} / ${thresholdTokens} (${percent}%)`
+  }
+  throw new TypeError(
+    'dsh-budget-tracker: budgetRepresentation must be one of ' + BUDGET_REPRESENTATIONS.join(', '),
+  )
+}
+
 /**
  * Resolve the adaptive pressure band from the relative remaining budget.
  *
@@ -335,7 +376,7 @@ function serviceForAgent(ctx, agent, serviceName) {
 }
 
 /** Resolve the post-downstream budget state used by both model-visible outputs. */
-async function resolveBudgetState(ctx, agent, signal) {
+async function resolveBudgetState(ctx, agent, signal, representation) {
   const compaction = serviceForAgent(ctx, agent, 'compaction')
   const llm = serviceForAgent(ctx, agent, 'llm')
   const tokenMeter = serviceForAgent(ctx, agent, 'tokenMeter')
@@ -379,10 +420,13 @@ async function resolveBudgetState(ctx, agent, signal) {
   const remaining = calculateContextRemaining(thresholdTokens, currentPressureTokens)
   if (remaining === undefined) return undefined
 
+  const text = formatBudgetText(remaining, thresholdTokens, representation)
+  if (text === undefined) return undefined
+
   return {
     thresholdTokens,
     remaining,
-    text: `context_remaining: ${remaining}`,
+    text,
   }
 }
 
@@ -394,6 +438,7 @@ async function resolveBudgetState(ctx, agent, signal) {
  * before both the budget snapshot and the runtime-context policy are resolved.
  */
 export function apply(ctx, config = {}) {
+  const budgetRepresentation = resolveBudgetRepresentation(config)
   const adaptivePolicy = resolveAdaptivePolicyConfig(config)
   const adaptiveGuidanceByAgent = new WeakMap()
   const runtimeCapabilities = { admissionContextRefresh: undefined }
@@ -414,7 +459,7 @@ export function apply(ctx, config = {}) {
     const decision = await next()
     if (decision.kind === 'reject' || signal?.aborted) return decision
 
-    const budget = await resolveBudgetState(ctx, agent, signal)
+    const budget = await resolveBudgetState(ctx, agent, signal, budgetRepresentation)
     if (signal?.aborted) return decision
 
     const band = promptMode === 'adaptive' && budget !== undefined
