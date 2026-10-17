@@ -2,13 +2,19 @@
 
 A deliberately tiny budget-awareness plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
 
-It exposes exactly one model-visible budget field:
+It exposes exactly one model-visible budget field. The default representation remains the historical raw scalar:
 
 ```text
 context_remaining: 190000
 ```
 
-No search budget, browse budget, or second model-visible pressure field is added. Optional prompt modes can explain the field, guide planning, or opt into an internal relative-pressure policy. None of them changes the budget calculation or Harness compaction policy.
+A hidden representation control can instead show the same budget normalized against the current proactive-compaction threshold:
+
+```text
+context_remaining: 190000 / 800000 (23.8%)
+```
+
+No search budget, browse budget, pressure label, or second model-visible budget field is added. Optional prompt modes can explain the field, guide planning, or opt into an internal relative-pressure policy. None of them changes the budget calculation or Harness compaction policy.
 
 ## Compatibility
 
@@ -111,6 +117,33 @@ The first request of a fresh session has no prior durable route, so the plugin e
 
 It does not fall back to the model's absolute context-window remainder, because that would give the same field two different meanings.
 
+## Budget representation
+
+`budgetRepresentation` is a hidden, non-volatile control. It is independent of `promptMode` and is not exposed in the Web UI.
+
+```yaml
+config:
+  budgetRepresentation: raw # or normalized
+```
+
+`raw` remains the default:
+
+```text
+context_remaining: 98694
+```
+
+`normalized` uses the current `thresholdTokens` as denominator and displays one decimal place:
+
+```text
+context_remaining: 98694 / 284819 (34.7%)
+```
+
+The exact unrounded ratio is used internally for adaptive band selection. Display rounding never feeds control decisions. Raw and normalized representations use the same static prompt for a given non-`none` `promptMode`; that prompt conditionally defines the normalized `R / B (P%)` notation without making representation itself part of the prompt treatment. `raw` preserves only the historical model-visible representation: this PR intentionally changes that shared non-`none` prompt baseline, so a raw run is not behaviorally identical to a pre-#11 default run.
+
+`normalized` is a bundled relative-pressure treatment: it exposes the denominator, relative fraction/percentage, and a longer redundant representation together. A comparative improvement therefore supports the broader claim that explicit relative-pressure representation improves salience; it does not isolate the percentage component by itself.
+
+Experiment observation is intentionally kept out of the runtime plugin. Comparative analysis can be performed later from complete canonical Harness session logs with external tooling rather than introducing a second plugin-owned trace format here.
+
 ## Prompt modes
 
 The dynamic budget snapshot and prompt guidance are deliberately separate. Configure `promptMode` on the plugin row:
@@ -195,16 +228,22 @@ On DeepSeek Harness Web, the bundle ships a browser-side configuration page for 
 
 The page presents all five prompt modes as selectable options and writes `promptMode` through Harness Settings/config-editor. Changes therefore persist in the active profile configuration instead of being stored separately by this plugin. **Reset to inherited** removes the profile override and restores the value supplied by the lower configuration layer; with the bundled patch, that inherited value is `semantic`.
 
-Only `promptMode` is exposed as a volatile Web-editable field. Adaptive thresholds are hidden non-volatile experiment controls; the budget calculation itself remains read-only and continues to derive from the active compaction policy. Selecting Adaptive requires a Harness runtime with admission-time `systemPrompt.refreshContext()`.
+Only `promptMode` is exposed as a volatile Web-editable field. Budget representation and adaptive thresholds are hidden non-volatile controls; the budget calculation itself remains read-only and continues to derive from the active compaction policy. Selecting Adaptive requires a Harness runtime with admission-time `systemPrompt.refreshContext()`.
 
 ## Dynamic context
 
 The budget value is added as a source-attributed snapshot context message after the pre-step chain settles. If the same retained value is already present, the plugin does not add a duplicate snapshot.
 
-The dynamic model-visible budget snapshot remains exactly one numeric field:
+The dynamic model-visible budget snapshot remains exactly one field. Depending on the hidden representation it is either:
 
 ```text
-context_remaining: <tokens>
+context_remaining: <remaining_tokens>
+```
+
+or:
+
+```text
+context_remaining: <remaining_tokens> / <threshold_tokens> (<percent>%)
 ```
 
 Adaptive mode does not add a second budget field such as `pressure_level`. The band name and thresholds remain model-invisible; only the selected natural-language guidance is contributed through Harness runtime context.
