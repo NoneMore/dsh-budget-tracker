@@ -15,7 +15,7 @@ window.__ModuleLoader__.load({
       en: {
         summary: 'Choose how strongly the model should react to the remaining context budget.',
         intro: 'Prompt guidance',
-        description: 'Controls guidance for context_remaining. Existing modes use static system-prompt guidance; Adaptive also adds sparse post-compaction policy updates. Budget calculation and compaction policy do not change.',
+        description: 'Controls guidance for context_remaining. Existing modes use static system-prompt guidance; Adaptive adds admission-refreshed runtime-context guidance. Budget calculation and compaction policy do not change.',
         loading: 'Loading configuration…',
         unavailable: 'Configuration is unavailable in this profile.',
         readonly: 'This profile does not allow configuration writes.',
@@ -37,12 +37,12 @@ window.__ModuleLoader__.load({
         modeBehavioral: 'Behavioral',
         modeBehavioralDesc: 'Also guide the model to actively limit avoidable context growth as the remaining budget decreases.',
         modeAdaptive: 'Adaptive',
-        modeAdaptiveDesc: 'Use Planning as the baseline and add sparse post-compaction guidance when relative pressure enters conserve or critical ranges.',
+        modeAdaptiveDesc: 'Use Planning as the baseline and add post-compaction guidance through runtime context. Requires admission-time context refresh support.',
       },
       zh: {
         summary: '选择模型应以多强的程度响应剩余上下文预算。',
         intro: 'Prompt 引导模式',
-        description: '控制 context_remaining 的引导方式。现有模式使用静态系统提示词；Adaptive 还会在压缩后根据相对压力按需注入稀疏的策略更新。预算计算方式和压缩策略不会因此改变。',
+        description: '控制 context_remaining 的引导方式。现有模式使用静态系统提示词；Adaptive 通过准入前刷新的运行时上下文加入动态引导。预算计算方式和压缩策略不会因此改变。',
         loading: '正在加载配置…',
         unavailable: '当前配置文件中无法编辑此项。',
         readonly: '当前配置文件不允许写入配置。',
@@ -64,7 +64,7 @@ window.__ModuleLoader__.load({
         modeBehavioral: 'Behavioral',
         modeBehavioralDesc: '进一步引导模型在剩余预算降低时主动减少不必要的上下文增长。',
         modeAdaptive: 'Adaptive',
-        modeAdaptiveDesc: '以 Planning 为静态基线，并在压缩后根据相对压力进入 conserve 或 critical 区间时按需注入策略更新。',
+        modeAdaptiveDesc: '以 Planning 为静态基线，并通过运行时上下文加入压缩后的动态引导；需要 Harness 支持准入前上下文刷新。',
       },
     }
 
