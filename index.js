@@ -7,8 +7,8 @@ export const PROMPT_MODES = Object.freeze(['none', 'semantic', 'planning', 'beha
 export const DEFAULT_PROMPT_MODE = 'semantic'
 export const PROMPT_SECTION_NAME = 'budget-tracker:context-remaining-guidance'
 export const PROMPT_SECTION_ORDER = 9800
-export const ADAPTIVE_POLICY_SOURCE = 'dsh-budget-tracker-policy'
-export const ADAPTIVE_POLICY_SECTION_NAME = 'budget-tracker:adaptive-guidance'
+export const ADAPTIVE_POLICY_CONTEXT_NAME = 'budget-tracker:adaptive-guidance'
+export const ADAPTIVE_POLICY_CONTEXT_ORDER = 9800
 
 // Experimental defaults. They remain model-invisible and are not exposed by
 // the Web configuration surface, but can be overridden in runtime/profile
@@ -42,15 +42,15 @@ const PROMPT_TEXT = Object.freeze({
   semantic: SEMANTIC_PROMPT_TEXT,
   planning: PLANNING_PROMPT_TEXT,
   behavioral: `${PLANNING_PROMPT_TEXT} As the remaining budget decreases, actively limit avoidable context growth: prioritize essential information, avoid unnecessary restatement, keep intermediate outputs compact, and prefer completing the current task over opening large new lines of work. Do not invent numeric thresholds or treat the value as a hard limit.`,
-  // Adaptive uses planning as its stable system-prompt baseline. Sparse
-  // post-compaction policy snapshots provide the pressure-specific behavior.
+  // Adaptive uses planning as its stable system-prompt baseline. A Harness
+  // runtime-context contribution supplies the pressure-specific behavior.
   adaptive: PLANNING_PROMPT_TEXT,
 })
 
 const ADAPTIVE_POLICY_TEXT = Object.freeze({
-  ample: 'Earlier adaptive context-conservation guidance no longer applies. Follow the currently active system guidance.',
-  conserve: 'Updated context-conservation guidance: reduce avoidable context growth. Avoid redundant restatement and low-value exploration, keep intermediate outputs and tool-result handling compact, and prefer advancing the current task. Necessary verification and exploration for correctness remain appropriate. This supersedes earlier adaptive context-conservation guidance.',
-  critical: 'Updated context-conservation guidance: context pressure is severe. Do only the work needed to finish the current task or reach a safe checkpoint. Avoid large new workstreams and nonessential exploration; prioritize finish, verify, and report. This supersedes earlier adaptive context-conservation guidance.',
+  ample: '',
+  conserve: 'Adaptive context-conservation guidance: reduce avoidable context growth. Avoid redundant restatement and low-value exploration, keep intermediate outputs and tool-result handling compact, and prefer advancing the current task. Necessary verification and exploration for correctness remain appropriate.',
+  critical: 'Adaptive context-conservation guidance: context pressure is severe. Do only the work needed to finish the current task or reach a safe checkpoint. Avoid large new workstreams and nonessential exploration; prioritize finish, verify, and report.',
 })
 
 /**
@@ -59,7 +59,7 @@ const ADAPTIVE_POLICY_TEXT = Object.freeze({
  * `semantic` only disambiguates the field. `planning` adds lightweight usage
  * guidance. `behavioral` additionally guides context-conserving behavior without
  * inventing thresholds or changing compaction policy. `adaptive` keeps the
- * `planning` baseline and adds sparse dynamic policy snapshots after pre-step.
+ * `planning` baseline and adds dynamic policy through Harness runtime context.
  *
  * @param {string | undefined} mode
  * @returns {string | undefined}
@@ -111,11 +111,14 @@ export function resolveAdaptivePolicyConfig(config = {}) {
 }
 
 /**
- * Register one stable system-prompt section whose text reads the current
- * volatile setting at assembly time. `none` therefore renders an empty
- * section without requiring a plugin reload.
+ * Register the stable system-prompt guidance plus the adaptive runtime context.
+ *
+ * The runtime context is marked required because the tracker guidance is an
+ * operational companion to context_remaining, not optional environment prose.
+ * Its provider is refreshed by Harness after pre-step, so it reads the band
+ * derived from the same post-compaction state as the budget snapshot.
  */
-function registerPrompt(ctx, config) {
+function registerPrompt(ctx, config, adaptiveGuidanceByAgent) {
   ctx.inject(['systemPrompt'], (inner) => {
     inner.effect(() => inner.systemPrompt.section({
       name: PROMPT_SECTION_NAME,
@@ -123,6 +126,14 @@ function registerPrompt(ctx, config) {
       text: () => resolvePromptText(currentPromptMode(config)) ?? '',
       interpolate: false,
     }), 'dsh-budget-tracker system prompt')
+
+    inner.effect(() => inner.systemPrompt.context({
+      name: ADAPTIVE_POLICY_CONTEXT_NAME,
+      order: ADAPTIVE_POLICY_CONTEXT_ORDER,
+      text: context => adaptiveGuidanceByAgent.get(context?.agent) ?? '',
+      interpolate: false,
+      required: true,
+    }), 'dsh-budget-tracker adaptive runtime context')
   })
 }
 
@@ -260,11 +271,11 @@ export function resolveAdaptiveBand(
   return 'ample'
 }
 
-/** Build one immutable source-attributed snapshot message without runtime deps. */
-function createSnapshotMessage(sourceKind, sectionName, text) {
-  const section = Object.freeze({ name: sectionName, text })
+/** Build one immutable budget snapshot message without runtime dependencies. */
+function createBudgetMessage(text) {
+  const section = Object.freeze({ name: 'budget-tracker:context-remaining', text })
   const source = Object.freeze({
-    kind: sourceKind,
+    kind: name,
     form: 'snapshot',
     sections: Object.freeze([section]),
   })
@@ -276,69 +287,19 @@ function createSnapshotMessage(sourceKind, sectionName, text) {
   })
 }
 
-function createBudgetMessage(text) {
-  return createSnapshotMessage(name, 'budget-tracker:context-remaining', text)
-}
-
-function createAdaptivePolicyMessage(text) {
-  return createSnapshotMessage(
-    ADAPTIVE_POLICY_SOURCE,
-    ADAPTIVE_POLICY_SECTION_NAME,
-    text,
-  )
-}
-
-/** Return the newest retained single-text snapshot from one producer. */
-function retainedSnapshotText(session, sourceKind) {
+/** Return the newest retained budget snapshot text, if one survives. */
+function retainedBudgetText(session) {
   const nodes = session?.surface?.nodes
   if (!nodes || typeof session.eventAt !== 'function') return undefined
   for (let index = nodes.length - 1; index >= 0; index -= 1) {
     const event = session.eventAt(nodes[index])
-    if (event?.type !== 'user/message' || event.data?.source?.kind !== sourceKind) continue
+    if (event?.type !== 'user/message' || event.data?.source?.kind !== name) continue
     const [block] = event.data.content ?? []
     return event.data.content?.length === 1 && block?.type === 'text'
       ? block.text
       : undefined
   }
   return undefined
-}
-
-/** Return the newest retained budget snapshot text, if one survives. */
-function retainedBudgetText(session) {
-  return retainedSnapshotText(session, name)
-}
-
-/** Return the newest retained adaptive-policy snapshot text, if one survives. */
-function retainedAdaptivePolicyText(session) {
-  return retainedSnapshotText(session, ADAPTIVE_POLICY_SOURCE)
-}
-
-/**
- * Decide whether the model-visible adaptive policy needs a new snapshot.
- *
- * An ample band is silent when no policy is retained. When a restrictive
- * policy is retained, ample emits one relaxation snapshot to supersede it.
- * Switching away from adaptive follows the same clearing rule. Restrictive
- * bands are re-published whenever their matching snapshot no longer survives.
- */
-function adaptivePolicyUpdateText(promptMode, band, retainedText) {
-  if (promptMode !== 'adaptive') {
-    if (retainedText === undefined || retainedText === ADAPTIVE_POLICY_TEXT.ample) {
-      return undefined
-    }
-    return ADAPTIVE_POLICY_TEXT.ample
-  }
-
-  if (band === undefined) return undefined
-  if (band === 'ample') {
-    if (retainedText === undefined || retainedText === ADAPTIVE_POLICY_TEXT.ample) {
-      return undefined
-    }
-    return ADAPTIVE_POLICY_TEXT.ample
-  }
-
-  const desired = ADAPTIVE_POLICY_TEXT[band]
-  return retainedText === desired ? undefined : desired
 }
 
 /**
@@ -418,11 +379,12 @@ async function resolveBudgetState(ctx, agent, signal) {
  *
  * The prepended listener wraps the complete pre-step chain. It computes after
  * next(), so any dsh-compaction-basic pruning/compaction in that chain lands
- * before the model-visible budget snapshot and adaptive policy are resolved.
+ * before both the budget snapshot and the runtime-context policy are resolved.
  */
 export function apply(ctx, config = {}) {
   const adaptivePolicy = resolveAdaptivePolicyConfig(config)
-  registerPrompt(ctx, config)
+  const adaptiveGuidanceByAgent = new WeakMap()
+  registerPrompt(ctx, config, adaptiveGuidanceByAgent)
   registerSettingsPresentation(ctx)
 
   return ctx.on('agent/pre-step', async (
@@ -435,33 +397,21 @@ export function apply(ctx, config = {}) {
     const decision = await next()
     if (decision.kind === 'reject' || signal?.aborted) return decision
 
-    const retainedPolicy = retainedAdaptivePolicyText(agent.session)
-    let policyText = adaptivePolicyUpdateText(promptMode, undefined, retainedPolicy)
-
     const budget = await resolveBudgetState(ctx, agent, signal)
     if (signal?.aborted) return decision
 
-    if (promptMode === 'adaptive' && budget !== undefined) {
-      const band = resolveAdaptiveBand(
-        budget.remaining,
-        budget.thresholdTokens,
-        adaptivePolicy,
-      )
-      policyText = adaptivePolicyUpdateText(promptMode, band, retainedPolicy)
-    }
+    const band = promptMode === 'adaptive' && budget !== undefined
+      ? resolveAdaptiveBand(budget.remaining, budget.thresholdTokens, adaptivePolicy)
+      : undefined
+    adaptiveGuidanceByAgent.set(agent, resolveAdaptivePolicyText(band) ?? '')
 
-    const additions = []
-    if (budget !== undefined && retainedBudgetText(agent.session) !== budget.text) {
-      additions.push(createBudgetMessage(budget.text))
+    if (budget === undefined || retainedBudgetText(agent.session) === budget.text) {
+      return decision
     }
-    if (policyText !== undefined) {
-      additions.push(createAdaptivePolicyMessage(policyText))
-    }
-    if (additions.length === 0) return decision
 
     return {
       ...decision,
-      messages: [...decision.messages, ...additions],
+      messages: [...decision.messages, createBudgetMessage(budget.text)],
     }
   }, { prepend: true })
 }

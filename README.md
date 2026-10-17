@@ -26,10 +26,9 @@ Profile installations use the Harness-provided runtime; the plugin does not
 bundle a second DSH copy.
 
 The APIs this plugin relies on — `agent/pre-step`, the token meter,
-`requestHeader()`, routed model metadata, and `dsh-compaction-basic` pressure
-resolution — are unchanged in `dsh-v0.2.0-rc.2` from the preceding release
-candidate line, so the budget calculation itself does not need a compatibility
-shim.
+`requestHeader()`, routed model metadata, `systemPrompt.context()`, and
+`dsh-compaction-basic` pressure resolution — are available in the supported
+Harness line.
 
 ## What `context_remaining` means
 
@@ -88,11 +87,11 @@ The value follows the **latest durable routed provider/model**, which is also th
 
 On DSH Web, presets that enable compaction (including the shipped `standard`, `ptc`, and `cordis` presets) mount it inside an isolated scope rather than as a host-global service. The tracker is installed once at the host level, resolves preset-owned services with `agentPresets.serviceFor(agent, ...)`, and falls back to services visible through the current agent/host context for shared capabilities such as `llm` and `tokenMeter`. This crosses the preset isolate boundary without requiring a host-global compaction service, so the tracker reads the same compaction engine that is actually driving that session.
 
-The tracker installs a prepended `agent/pre-step` wrapper and computes only after `next()` returns. This means any downstream pruning or proactive compaction has already completed before `context_remaining` is measured and injected into the request. A step that compacts therefore sees the **post-compaction** remaining budget, not the stale value that triggered compaction.
+The tracker installs a prepended `agent/pre-step` wrapper and computes only after `next()` returns. This means any downstream pruning or proactive compaction has already completed before `context_remaining` and the adaptive band are measured. A step that compacts therefore sees the **post-compaction** remaining budget, not the stale value that triggered compaction.
 
-Adaptive policy resolution uses this same post-compaction measurement. The model therefore never receives a pressure-specific adaptive instruction selected from the stale pre-compaction state alongside a newer `context_remaining` value.
+Adaptive guidance is contributed through Harness `systemPrompt.context()`. Harness refreshes registered runtime context after pre-step, so the guidance used for request admission is derived from the same post-compaction state as the budget snapshot.
 
-The first request of a fresh session has no prior durable route, so the plugin emits nothing. It also emits no budget when:
+The first request of a fresh session has no prior durable route, so the plugin emits no budget. It also emits no budget when:
 
 - no active compaction service is available for the agent;
 - automatic compaction is disabled with `auto: false`;
@@ -111,7 +110,7 @@ The dynamic budget snapshot and prompt guidance are deliberately separate. Confi
 | `semantic` | **Default.** Static system prompt explaining that `context_remaining` is the budget before proactive compaction, not the model's absolute context-window remainder. |
 | `planning` | Includes the semantic explanation and asks the model to use the value as a context-pressure signal when deciding how much context to spend on the current response. |
 | `behavioral` | Builds on `planning` and statically guides context-conserving behavior as the budget decreases: prioritize essentials, avoid unnecessary restatement, keep intermediate outputs compact, and prefer finishing current work over opening large new lines of work. It still defines no numeric thresholds. |
-| `adaptive` | Uses the same static baseline as `planning`, then adds sparse post-compaction policy snapshots when the internally resolved relative-pressure band changes. |
+| `adaptive` | Uses the same static baseline as `planning`, then contributes pressure-specific guidance through Harness runtime context. |
 | `none` | Adds no static prompt guidance, matching the pre-prompt behavior of the plugin. |
 
 The bundled patch defaults to:
@@ -157,22 +156,30 @@ The plugin requires:
 
 Invalid ordering fails plugin activation rather than silently selecting a fallback policy.
 
-Adaptive guidance is transition-driven rather than injected on every step. The plugin keeps two independent source-attributed snapshot streams:
+Adaptive state is not stored as a second plugin-owned conversation protocol. The tracker keeps only the current per-agent guidance in process memory and exposes it as a required Harness runtime-context contribution:
 
 ```text
-dsh-budget-tracker         -> context_remaining budget state
-dsh-budget-tracker-policy  -> current adaptive guidance state
+budget-tracker:adaptive-guidance
 ```
 
-The budget snapshot continues to update whenever its value changes. Adaptive guidance is emitted only when the model-visible policy needs updating:
+Harness evaluates that provider again during admission refresh after pre-step. The contribution is:
 
-- entering `conserve` or `critical` publishes the corresponding guidance once;
-- any transition between restrictive bands publishes the new guidance once;
-- returning to `ample` publishes one neutral relaxation snapshot only when older restrictive adaptive guidance is still retained;
-- if compaction removes the active restrictive policy snapshot while the session remains in that band, the next step republishes it;
-- switching away from `adaptive` similarly publishes one neutral relaxation snapshot when needed so stale adaptive restrictions do not remain active.
+- empty in `ample`;
+- the conserve guidance in `conserve`;
+- the critical guidance in `critical`;
+- empty when adaptive mode is disabled or the current budget cannot be resolved.
 
-There is no hysteresis and no special handling for why the ratio changed. The exact current post-compaction ratio is authoritative.
+Harness owns replacement of older runtime-context snapshots, so the plugin does not emit neutral "relaxation" messages or scan retained conversation history to decide which policy is active.
+
+There is no hysteresis or cooldown. The exact current post-compaction ratio is authoritative. If compaction moves the ratio from `critical` back to `ample`, the adaptive contribution becomes empty on that same request's admission refresh.
+
+## Cache and context-growth behavior
+
+`context_remaining` remains an independent, very small source-attributed snapshot because its numeric value changes frequently. Moving that high-frequency value into Harness's complete runtime-context snapshot would cause unrelated runtime-context text to be repeated whenever the number changes.
+
+Adaptive policy is different: it changes only when the resolved band changes, so it is a good fit for `systemPrompt.context()`. Harness treats runtime context as cache-safe derived history and appends a changed current snapshot after retained history rather than rewriting the stable system-prompt prefix.
+
+This keeps the high-frequency budget update cheap while avoiding a plugin-owned policy-message state machine.
 
 ## Configure from the Web Plugins page
 
@@ -186,13 +193,13 @@ Only `promptMode` is exposed as a volatile Web-editable field. Adaptive threshol
 
 The budget value is added as a source-attributed snapshot context message after the pre-step chain settles. If the same retained value is already present, the plugin does not add a duplicate snapshot.
 
-The dynamic model-visible budget snapshot remains exactly one field:
+The dynamic model-visible budget snapshot remains exactly one numeric field:
 
 ```text
 context_remaining: <tokens>
 ```
 
-Adaptive mode never adds a second budget field such as `pressure_level`. Its separate policy snapshot contains natural-language guidance selected internally from the relative band; the band name itself remains model-invisible.
+Adaptive mode does not add a second budget field such as `pressure_level`. The band name and thresholds remain model-invisible; only the selected natural-language guidance is contributed through Harness runtime context.
 
 This plugin intentionally targets `dsh-compaction-basic` and expects the active `compaction` service to expose its resolved pressure-policy configuration.
 
@@ -218,7 +225,7 @@ After the repository is public (or when your Git credentials allow access to the
 dsh plugin --profile <profile> add github:NoneMore/dsh-budget-tracker
 ```
 
-This package is plain JavaScript, has no bundled runtime dependencies, and has no build/prepare step.
+This package is plain JavaScript, has no build/prepare step.
 
 ## Test
 
@@ -228,7 +235,7 @@ npm test
 
 ## Design goal
 
-This is inspired by the budget-awareness idea in Google's `budget-aware-agent`, but intentionally does not port its search/browse budget machinery. DeepSeek Harness already owns pressure measurement and compaction policy; this plugin surfaces the remaining pre-compaction budget and can optionally apply a small, relative, transition-driven control policy without changing that underlying compaction behavior.
+This is inspired by the budget-awareness idea in Google's `budget-aware-agent`, but intentionally does not port its search/browse budget machinery. DeepSeek Harness already owns pressure measurement and compaction policy; this plugin surfaces the remaining pre-compaction budget and can optionally apply a small relative control policy without changing that underlying compaction behavior.
 
 ## License
 
