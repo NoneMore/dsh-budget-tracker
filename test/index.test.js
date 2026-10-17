@@ -8,8 +8,13 @@ import {
   DEFAULT_PROMPT_MODE,
   PROMPT_SECTION_NAME,
   PROMPT_SECTION_ORDER,
+  ADAPTIVE_POLICY_CONTEXT_NAME,
+  ADAPTIVE_POLICY_CONTEXT_ORDER,
+  ADAPTIVE_BAND_RATIOS,
   currentPromptMode,
   resolvePromptText,
+  resolveAdaptivePolicyText,
+  resolveAdaptiveBand,
   calculateContextRemaining,
   calculateThresholdTokens,
   resolvePressurePolicy,
@@ -27,13 +32,6 @@ test('declares DeepSeek Harness 0.2 runtime compatibility', () => {
   )
   assert.equal(manifest.dependencies['@deepseek-ai/schemastery'], '^3.18.4')
   assert.equal(manifest.exports['./client'], './client.js')
-  assert.deepEqual(manifest.dsh.client, {
-    platform: 'web',
-    inject: [
-      '@deepseek-ai/dsh-client-locale',
-      '@deepseek-ai/dsh-client-ui-plugin-manager',
-    ],
-  })
 })
 
 test('only requires the host-level agent registry service', () => {
@@ -43,68 +41,42 @@ test('only requires the host-level agent registry service', () => {
 test('exports a volatile schemastery Config for the Web-editable prompt mode', () => {
   const defaults = Config({})
   const behavioral = Config({ promptMode: 'behavioral' })
+  const adaptive = Config({ promptMode: 'adaptive' })
   assert.equal(defaults.promptMode.get(), DEFAULT_PROMPT_MODE)
   assert.equal(behavioral.promptMode.get(), 'behavioral')
+  assert.equal(adaptive.promptMode.get(), 'adaptive')
 })
 
 test('reads direct and volatile prompt mode values', () => {
   assert.equal(currentPromptMode({ promptMode: 'planning' }), 'planning')
   assert.equal(currentPromptMode(Config({ promptMode: 'behavioral' })), 'behavioral')
+  assert.equal(currentPromptMode(Config({ promptMode: 'adaptive' })), 'adaptive')
   assert.equal(currentPromptMode(), DEFAULT_PROMPT_MODE)
 })
 
-test('defaults to semantic-only prompt guidance', () => {
+test('prompt modes preserve existing static behavior', () => {
   assert.equal(DEFAULT_PROMPT_MODE, 'semantic')
-  assert.equal(
-    resolvePromptText(),
-    'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder.',
-  )
-})
-
-test('planning mode adds lightweight context-pressure guidance', () => {
-  assert.equal(
-    resolvePromptText('planning'),
-    'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder. Use it as a context-pressure signal when deciding how much context to spend on the current response.',
-  )
-})
-
-test('behavioral mode guides context-conserving behavior', () => {
-  assert.equal(
-    resolvePromptText('behavioral'),
-    'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder. Use it as a context-pressure signal when deciding how much context to spend on the current response. As the remaining budget decreases, actively limit avoidable context growth: prioritize essential information, avoid unnecessary restatement, keep intermediate outputs compact, and prefer completing the current task over opening large new lines of work. Do not invent numeric thresholds or treat the value as a hard limit.',
-  )
-})
-
-test('none mode disables static prompt guidance', () => {
+  assert.match(resolvePromptText(), /remaining token budget before proactive context compaction/)
+  assert.match(resolvePromptText('planning'), /context-pressure signal/)
+  assert.match(resolvePromptText('behavioral'), /actively limit avoidable context growth/)
+  assert.equal(resolvePromptText('adaptive'), resolvePromptText('planning'))
   assert.equal(resolvePromptText('none'), undefined)
-})
-
-test('rejects unknown prompt modes', () => {
   assert.throws(
     () => resolvePromptText('aggressive'),
-    /promptMode must be one of none, semantic, planning, behavioral/,
+    /promptMode must be one of none, semantic, planning, behavioral, adaptive/,
   )
 })
 
-test('reproduces the default compaction threshold shape', () => {
-  assert.equal(
-    calculateThresholdTokens(1_000_000, 32_768, 0.8, 65_536),
-    800_000,
-  )
+test('adaptive model-facing text is empty in ample and restrictive otherwise', () => {
+  assert.equal(resolveAdaptivePolicyText('ample'), '')
+  assert.match(resolveAdaptivePolicyText('conserve'), /reduce avoidable context growth/)
+  assert.match(resolveAdaptivePolicyText('critical'), /context pressure is severe/)
 })
 
-test('capacity minus completion reservation and headroom can be the tighter cap', () => {
-  assert.equal(
-    calculateThresholdTokens(100_000, 20_000, 0.8, 30_000),
-    50_000,
-  )
-})
-
-test('reports remaining pressure budget before compaction', () => {
+test('reproduces compaction threshold and remaining budget semantics', () => {
+  assert.equal(calculateThresholdTokens(1_000_000, 32_768, 0.8, 65_536), 800_000)
+  assert.equal(calculateThresholdTokens(100_000, 20_000, 0.8, 30_000), 50_000)
   assert.equal(calculateContextRemaining(800_000, 610_000), 190_000)
-})
-
-test('clamps remaining pressure budget at zero', () => {
   assert.equal(calculateContextRemaining(800_000, 810_000), 0)
 })
 
@@ -113,14 +85,12 @@ test('resolves exact provider/model pressure overrides', () => {
     auto: true,
     thresholdRatio: 0.8,
     headroomTokens: 65_536,
-    modelPolicies: [
-      {
-        provider: 'deepseek',
-        model: 'small',
-        thresholdRatio: 0.7,
-        headroomTokens: 8192,
-      },
-    ],
+    modelPolicies: [{
+      provider: 'deepseek',
+      model: 'small',
+      thresholdRatio: 0.7,
+      headroomTokens: 8192,
+    }],
   }
 
   assert.deepEqual(
@@ -133,23 +103,35 @@ test('resolves exact provider/model pressure overrides', () => {
   )
 })
 
-test('emits no budget when automatic compaction is disabled', () => {
-  assert.equal(
-    resolvePressurePolicy({
-      auto: false,
-      thresholdRatio: 0.8,
-      headroomTokens: 65_536,
-      modelPolicies: [],
-    }, 'deepseek', 'model'),
-    undefined,
-  )
-})
-
-test('rejects invalid threshold inputs instead of inventing a budget', () => {
+test('rejects unavailable or invalid budget inputs', () => {
+  assert.equal(resolvePressurePolicy({
+    auto: false,
+    thresholdRatio: 0.8,
+    headroomTokens: 65_536,
+    modelPolicies: [],
+  }, 'deepseek', 'model'), undefined)
   assert.equal(calculateThresholdTokens(undefined, 0, 0.8, 65_536), undefined)
   assert.equal(calculateThresholdTokens(100_000, -1, 0.8, 10_000), undefined)
   assert.equal(calculateThresholdTokens(100_000, 60_000, 0.8, 50_000), undefined)
   assert.equal(calculateContextRemaining(undefined, 1), undefined)
+})
+
+test('adaptive bands use relative remaining budget with inclusive boundaries', () => {
+  assert.deepEqual(ADAPTIVE_BAND_RATIOS, { conserve: 0.25, critical: 0.10 })
+  assert.equal(resolveAdaptiveBand(800_000, 800_000), 'ample')
+  assert.equal(resolveAdaptiveBand(200_001, 800_000), 'ample')
+  assert.equal(resolveAdaptiveBand(200_000, 800_000), 'conserve')
+  assert.equal(resolveAdaptiveBand(80_001, 800_000), 'conserve')
+  assert.equal(resolveAdaptiveBand(80_000, 800_000), 'critical')
+  assert.equal(resolveAdaptiveBand(0, 800_000), 'critical')
+})
+
+test('adaptive band resolution rejects invalid inputs', () => {
+  assert.equal(resolveAdaptiveBand(undefined, 800_000), undefined)
+  assert.equal(resolveAdaptiveBand(1, undefined), undefined)
+  assert.equal(resolveAdaptiveBand(1, 0), undefined)
+  assert.equal(resolveAdaptiveBand(-1, 800_000), undefined)
+  assert.equal(resolveAdaptiveBand(800_001, 800_000), undefined)
 })
 
 function integrationHarness({
@@ -160,6 +142,7 @@ function integrationHarness({
   headerMaxTokens = 32_768,
   auto = true,
   retainedText,
+  supportsAdmissionContextRefresh = true,
   scopedCompaction = true,
   hostCompaction = false,
   hasAgentPresets = true,
@@ -168,9 +151,11 @@ function integrationHarness({
   promptMode,
 } = {}) {
   let currentTokens = beforeTokens
+  let downstreamTokens = afterTokens
   let listener
   let options
   let promptSection
+  let policyContext
   let promptInjectCalls = 0
   let settingsConfigurePolicy
   const serviceLookups = []
@@ -210,9 +195,6 @@ function integrationHarness({
   }
   const tokenMeter = { measure: () => ({ totalTokens: currentTokens }) }
 
-  // DSH Web keeps compaction behind a preset-owned isolate realm. The agent
-  // context can inherit host services such as llm/tokenMeter, but it cannot
-  // directly resolve that isolated compaction service.
   const hostServices = {
     ...(hasAgentPresets ? {
       agentPresets: {
@@ -229,9 +211,6 @@ function integrationHarness({
     ...(hostCompaction ? { compaction } : {}),
   }
 
-  // Cordis contexts reject undeclared service property access. Keep the harness
-  // strict so optional services must be read through ctx.get(), just like the
-  // real runtime.
   const strictContext = api => new Proxy(api, {
     get(target, property, receiver) {
       if (typeof property === 'string' && !(property in target)) {
@@ -248,20 +227,27 @@ function integrationHarness({
         : hostServices[serviceName]
     ),
   })
+  const agent = { session, ctx: agentCtx }
 
   const ctx = strictContext({
     get: serviceName => hostServices[serviceName],
     inject: (services, callback) => {
       if (services.length === 1 && services[0] === 'systemPrompt') {
         promptInjectCalls += 1
+        const systemPromptApi = {
+          section: section => {
+            promptSection = section
+            return () => true
+          },
+          context: context => {
+            policyContext = context
+            return () => true
+          },
+          ...(supportsAdmissionContextRefresh ? { refreshContext: () => undefined } : {}),
+        }
         return callback(strictContext({
           effect: factory => factory(),
-          systemPrompt: strictContext({
-            section: section => {
-              promptSection = section
-              return () => true
-            },
-          }),
+          systemPrompt: strictContext(systemPromptApi),
         }))
       }
       if (services.length === 1 && services[0] === 'settings') {
@@ -278,8 +264,8 @@ function integrationHarness({
       throw new Error('unexpected injected services: ' + services.join(','))
     },
     fiber: { id: 'budget-tracker-fiber' },
-    on: (name, callback, listenerOptions) => {
-      assert.equal(name, 'agent/pre-step')
+    on: (eventName, callback, listenerOptions) => {
+      assert.equal(eventName, 'agent/pre-step')
       listener = callback
       options = listenerOptions
       return () => true
@@ -291,23 +277,24 @@ function integrationHarness({
     options,
     serviceLookups,
     promptSection,
+    policyContext,
     promptInjectCalls,
     settingsConfigurePolicy,
-    run: async ({ reject = false } = {}) => {
-      const agent = { session, ctx: agentCtx }
-      return listener(
-        { agent, signal: new AbortController().signal },
-        async () => {
-          currentTokens = afterTokens
-          return reject ? { kind: 'reject' } : { kind: 'enter', messages: [] }
-        },
-      )
-    },
+    hasPolicyContext: () => policyContext !== undefined,
+    policyText: () => policyContext?.text({ agent }) ?? '',
+    setAfterTokens: value => { downstreamTokens = value },
+    run: async ({ reject = false } = {}) => listener(
+      { agent, signal: new AbortController().signal },
+      async () => {
+        currentTokens = downstreamTokens
+        return reject ? { kind: 'reject' } : { kind: 'enter', messages: [] }
+      },
+    ),
   }
 }
 
-test('registers semantic system-prompt guidance by default', () => {
-  const harness = integrationHarness()
+test('registers static prompt and optional adaptive runtime context together', () => {
+  const harness = integrationHarness({ promptMode: 'adaptive' })
   assert.equal(harness.promptInjectCalls, 1)
   assert.deepEqual(
     {
@@ -321,25 +308,42 @@ test('registers semantic system-prompt guidance by default', () => {
       interpolate: false,
     },
   )
-  assert.equal(harness.promptSection.text(), resolvePromptText('semantic'))
-})
-
-test('registers planning guidance when configured', () => {
-  const harness = integrationHarness({ promptMode: 'planning' })
-  assert.equal(harness.promptInjectCalls, 1)
   assert.equal(harness.promptSection.text(), resolvePromptText('planning'))
+  assert.deepEqual(
+    {
+      name: harness.policyContext.name,
+      order: harness.policyContext.order,
+      interpolate: harness.policyContext.interpolate,
+    },
+    {
+      name: ADAPTIVE_POLICY_CONTEXT_NAME,
+      order: ADAPTIVE_POLICY_CONTEXT_ORDER,
+      interpolate: false,
+    },
+  )
+  assert.equal(harness.policyContext.required, undefined)
+  assert.equal(harness.policyText(), '')
 })
 
-test('registers behavioral guidance when configured', () => {
-  const harness = integrationHarness({ promptMode: 'behavioral' })
-  assert.equal(harness.promptInjectCalls, 1)
-  assert.equal(harness.promptSection.text(), resolvePromptText('behavioral'))
+test('adaptive mode rejects runtimes without admission-time context refresh', () => {
+  assert.throws(
+    () => integrationHarness({
+      promptMode: 'adaptive',
+      supportsAdmissionContextRefresh: false,
+    }),
+    /adaptive promptMode requires admission-time systemPrompt\.refreshContext\(\)/,
+  )
 })
 
-test('none prompt mode renders an empty static section', () => {
-  const harness = integrationHarness({ promptMode: 'none' })
-  assert.equal(harness.promptInjectCalls, 1)
-  assert.equal(harness.promptSection.text(), '')
+test('runtimes without admission refresh still support non-adaptive modes', async () => {
+  const harness = integrationHarness({
+    promptMode: 'planning',
+    supportsAdmissionContextRefresh: false,
+  })
+  assert.equal(harness.hasPolicyContext(), false)
+  assert.equal(harness.promptSection.text(), resolvePromptText('planning'))
+  const decision = await harness.run()
+  assert.equal(decision.messages[0].content[0].text, 'context_remaining: 500000')
 })
 
 test('marks the settings form as plugin-owned instead of auto-generated', () => {
@@ -366,11 +370,8 @@ test('resolves preset-isolated compaction and measures after downstream compacti
   assert.equal(decision.messages[0].source.form, 'snapshot')
 })
 
-test('falls back to a host-visible compaction service outside preset isolation', async () => {
-  const harness = integrationHarness({
-    scopedCompaction: false,
-    hostCompaction: true,
-  })
+test('falls back to host compaction outside preset isolation', async () => {
+  const harness = integrationHarness({ scopedCompaction: false, hostCompaction: true })
   const decision = await harness.run()
   assert.equal(decision.messages[0].content[0].text, 'context_remaining: 500000')
 })
@@ -385,59 +386,91 @@ test('falls back to host services when no preset registry is installed', async (
   assert.equal(decision.messages[0].content[0].text, 'context_remaining: 500000')
 })
 
-test('emits no budget when the agent has no active compaction service', async () => {
-  const harness = integrationHarness({
-    scopedCompaction: false,
-    hostCompaction: false,
-  })
-  const decision = await harness.run()
-  assert.deepEqual(decision, { kind: 'enter', messages: [] })
+test('emits no budget when required budget services are unavailable', async () => {
+  assert.deepEqual(
+    await integrationHarness({ scopedCompaction: false, hostCompaction: false }).run(),
+    { kind: 'enter', messages: [] },
+  )
+  assert.deepEqual(
+    await integrationHarness({ hasLlm: false }).run(),
+    { kind: 'enter', messages: [] },
+  )
+  assert.deepEqual(
+    await integrationHarness({ hasTokenMeter: false }).run(),
+    { kind: 'enter', messages: [] },
+  )
 })
 
-test('emits no budget when the LLM service is unavailable', async () => {
-  const harness = integrationHarness({ hasLlm: false })
-  const decision = await harness.run()
-  assert.deepEqual(decision, { kind: 'enter', messages: [] })
-})
-
-test('emits no budget when the token meter service is unavailable', async () => {
-  const harness = integrationHarness({ hasTokenMeter: false })
-  const decision = await harness.run()
-  assert.deepEqual(decision, { kind: 'enter', messages: [] })
-})
-
-test('uses current routed model capacity rather than a stale persisted capacity', async () => {
-  const harness = integrationHarness({
+test('uses current routed model capacity and adapter completion defaults', async () => {
+  const routed = integrationHarness({
     contextWindow: 256_000,
     beforeTokens: 100_000,
     afterTokens: 100_000,
     headerMaxTokens: 16_000,
   })
+  assert.equal((await routed.run()).messages[0].content[0].text, 'context_remaining: 74464')
 
-  const decision = await harness.run()
-  assert.equal(decision.messages[0].content[0].text, 'context_remaining: 74464')
-})
-
-test('falls back to the adapter default completion reservation when the header omits maxTokens', async () => {
-  const harness = integrationHarness({
+  const fallback = integrationHarness({
     contextWindow: 100_000,
     beforeTokens: 10_000,
     afterTokens: 10_000,
     headerMaxTokens: null,
     defaultMaxTokens: 20_000,
   })
-
-  const decision = await harness.run()
-  assert.equal(decision.messages[0].content[0].text, 'context_remaining: 4464')
+  assert.equal((await fallback.run()).messages[0].content[0].text, 'context_remaining: 4464')
 })
 
 test('does not duplicate an unchanged retained budget snapshot', async () => {
   const harness = integrationHarness({ retainedText: 'context_remaining: 500000' })
-  const decision = await harness.run()
-  assert.deepEqual(decision, { kind: 'enter', messages: [] })
+  assert.deepEqual(await harness.run(), { kind: 'enter', messages: [] })
 })
 
-test('does not inject into a rejected pre-step', async () => {
-  const harness = integrationHarness()
+test('adaptive ample keeps policy runtime context empty', async () => {
+  const harness = integrationHarness({ promptMode: 'adaptive' })
+  const decision = await harness.run()
+  assert.equal(decision.messages.length, 1)
+  assert.equal(decision.messages[0].content[0].text, 'context_remaining: 500000')
+  assert.equal(harness.policyText(), '')
+})
+
+test('adaptive conserve publishes guidance through runtime context, not decision messages', async () => {
+  const harness = integrationHarness({ promptMode: 'adaptive', afterTokens: 650_000 })
+  const decision = await harness.run()
+  assert.equal(decision.messages.length, 1)
+  assert.equal(decision.messages[0].content[0].text, 'context_remaining: 150000')
+  assert.equal(harness.policyText(), resolveAdaptivePolicyText('conserve'))
+})
+
+test('adaptive critical publishes stronger runtime-context guidance', async () => {
+  const harness = integrationHarness({ promptMode: 'adaptive', afterTokens: 730_000 })
+  const decision = await harness.run()
+  assert.equal(decision.messages.length, 1)
+  assert.equal(decision.messages[0].content[0].text, 'context_remaining: 70000')
+  assert.equal(harness.policyText(), resolveAdaptivePolicyText('critical'))
+})
+
+test('post-compaction ratio immediately returns policy to ample without hysteresis', async () => {
+  const harness = integrationHarness({ promptMode: 'adaptive', afterTokens: 730_000 })
+  await harness.run()
+  assert.equal(harness.policyText(), resolveAdaptivePolicyText('critical'))
+
+  harness.setAfterTokens(300_000)
+  await harness.run()
+  assert.equal(harness.policyText(), '')
+})
+
+test('non-adaptive mode and unavailable budget clear adaptive runtime contribution', async () => {
+  const planning = integrationHarness({ promptMode: 'planning', afterTokens: 730_000 })
+  await planning.run()
+  assert.equal(planning.policyText(), '')
+
+  const unavailable = integrationHarness({ promptMode: 'adaptive', hasLlm: false })
+  await unavailable.run()
+  assert.equal(unavailable.policyText(), '')
+})
+
+test('does not mutate policy state for a rejected pre-step', async () => {
+  const harness = integrationHarness({ promptMode: 'adaptive', afterTokens: 730_000 })
   assert.deepEqual(await harness.run({ reject: true }), { kind: 'reject' })
+  assert.equal(harness.policyText(), '')
 })

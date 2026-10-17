@@ -159,6 +159,20 @@ function readyState(promptMode, {
   }
 }
 
+test('browser prompt mode form exposes adaptive mode', () => {
+  const { component, render } = loadPromptModeForm()
+  const form = {
+    state: readyState('semantic'),
+    mutate: async () => true,
+  }
+  const tree = render(component, { t: key => key, view: 'page', form })
+  const adaptive = findAll(
+    tree,
+    node => node.type === 'input' && node.props.value === 'adaptive',
+  )[0]
+  assert.ok(adaptive)
+})
+
 test('browser prompt mode form saves a staged mode with the current revision', async () => {
   const { component, render } = loadPromptModeForm()
   const calls = []

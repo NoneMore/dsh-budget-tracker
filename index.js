@@ -3,23 +3,54 @@ import { randomUUID } from 'node:crypto'
 
 export const name = 'dsh-budget-tracker'
 
-export const PROMPT_MODES = Object.freeze(['none', 'semantic', 'planning', 'behavioral'])
+export const PROMPT_MODES = Object.freeze(['none', 'semantic', 'planning', 'behavioral', 'adaptive'])
 export const DEFAULT_PROMPT_MODE = 'semantic'
 export const PROMPT_SECTION_NAME = 'budget-tracker:context-remaining-guidance'
 export const PROMPT_SECTION_ORDER = 9800
+export const ADAPTIVE_POLICY_CONTEXT_NAME = 'budget-tracker:adaptive-guidance'
+export const ADAPTIVE_POLICY_CONTEXT_ORDER = 9800
+
+// Experimental defaults. They remain model-invisible and are not exposed by
+// the Web configuration surface, but can be overridden in runtime/profile
+// config so controlled experiments do not require rebuilding the plugin.
+export const ADAPTIVE_BAND_RATIOS = Object.freeze({
+  conserve: 0.25,
+  critical: 0.10,
+})
+export const DEFAULT_ADAPTIVE_POLICY = Object.freeze({
+  conserveRatio: ADAPTIVE_BAND_RATIOS.conserve,
+  criticalRatio: ADAPTIVE_BAND_RATIOS.critical,
+})
 
 /**
- * Runtime Config schema. The field is volatile so the Web settings surface can
- * edit it without turning prompt selection into a separate persistence system.
+ * Runtime Config schema. Only promptMode is volatile/Web-editable. Adaptive
+ * cutoffs are hidden experiment controls and intentionally require ordinary
+ * profile/runtime configuration rather than hot Web mutation.
  */
 export const Config = z.object({
   promptMode: z.union([...PROMPT_MODES]).default(DEFAULT_PROMPT_MODE).volatile(),
+  adaptivePolicy: z.object({
+    conserveRatio: z.number().min(0).max(1).default(DEFAULT_ADAPTIVE_POLICY.conserveRatio),
+    criticalRatio: z.number().min(0).max(1).default(DEFAULT_ADAPTIVE_POLICY.criticalRatio),
+  }).default({}),
 })
 
+const SEMANTIC_PROMPT_TEXT = 'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder.'
+const PLANNING_PROMPT_TEXT = `${SEMANTIC_PROMPT_TEXT} Use it as a context-pressure signal when deciding how much context to spend on the current response.`
+
 const PROMPT_TEXT = Object.freeze({
-  semantic: 'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder.',
-  planning: 'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder. Use it as a context-pressure signal when deciding how much context to spend on the current response.',
-  behavioral: 'context_remaining reports the remaining token budget before proactive context compaction, not the model\'s absolute context-window remainder. Use it as a context-pressure signal when deciding how much context to spend on the current response. As the remaining budget decreases, actively limit avoidable context growth: prioritize essential information, avoid unnecessary restatement, keep intermediate outputs compact, and prefer completing the current task over opening large new lines of work. Do not invent numeric thresholds or treat the value as a hard limit.',
+  semantic: SEMANTIC_PROMPT_TEXT,
+  planning: PLANNING_PROMPT_TEXT,
+  behavioral: `${PLANNING_PROMPT_TEXT} As the remaining budget decreases, actively limit avoidable context growth: prioritize essential information, avoid unnecessary restatement, keep intermediate outputs compact, and prefer completing the current task over opening large new lines of work. Do not invent numeric thresholds or treat the value as a hard limit.`,
+  // Adaptive uses planning as its stable system-prompt baseline. A Harness
+  // runtime-context contribution supplies the pressure-specific behavior.
+  adaptive: PLANNING_PROMPT_TEXT,
+})
+
+const ADAPTIVE_POLICY_TEXT = Object.freeze({
+  ample: '',
+  conserve: 'Adaptive context-conservation guidance: reduce avoidable context growth. Avoid redundant restatement and low-value exploration, keep intermediate outputs and tool-result handling compact, and prefer advancing the current task. Necessary verification and exploration for correctness remain appropriate.',
+  critical: 'Adaptive context-conservation guidance: context pressure is severe. Do only the work needed to finish the current task or reach a safe checkpoint. Avoid large new workstreams and nonessential exploration; prioritize finish, verify, and report.',
 })
 
 /**
@@ -27,7 +58,8 @@ const PROMPT_TEXT = Object.freeze({
  *
  * `semantic` only disambiguates the field. `planning` adds lightweight usage
  * guidance. `behavioral` additionally guides context-conserving behavior without
- * inventing thresholds or changing compaction policy.
+ * inventing thresholds or changing compaction policy. `adaptive` keeps the
+ * `planning` baseline and adds dynamic policy through Harness runtime context.
  *
  * @param {string | undefined} mode
  * @returns {string | undefined}
@@ -41,6 +73,11 @@ export function resolvePromptText(mode = DEFAULT_PROMPT_MODE) {
   )
 }
 
+/** Resolve one model-facing adaptive policy text. */
+export function resolveAdaptivePolicyText(band) {
+  return ADAPTIVE_POLICY_TEXT[band]
+}
+
 /** Resolve a direct test/config value or a Schemastery volatile reference. */
 export function currentPromptMode(config = {}) {
   const configured = config?.promptMode
@@ -51,11 +88,41 @@ export function currentPromptMode(config = {}) {
 }
 
 /**
- * Register one stable system-prompt section whose text reads the current
- * volatile setting at assembly time. `none` therefore renders an empty
- * section without requiring a plugin reload.
+ * Resolve and validate the hidden adaptive experiment controls.
+ *
+ * Cross-field ordering is validated here because Schemastery validates fields
+ * independently. Invalid policy config is an activation error rather than a
+ * silent fallback that would contaminate an experiment.
  */
-function registerPrompt(ctx, config) {
+export function resolveAdaptivePolicyConfig(config = {}) {
+  const configured = config?.adaptivePolicy ?? {}
+  const conserveRatio = configured.conserveRatio ?? DEFAULT_ADAPTIVE_POLICY.conserveRatio
+  const criticalRatio = configured.criticalRatio ?? DEFAULT_ADAPTIVE_POLICY.criticalRatio
+
+  if (!Number.isFinite(conserveRatio) || !Number.isFinite(criticalRatio)
+    || criticalRatio <= 0 || conserveRatio >= 1
+    || criticalRatio >= conserveRatio) {
+    throw new TypeError(
+      'dsh-budget-tracker: adaptivePolicy must satisfy 0 < criticalRatio < conserveRatio < 1',
+    )
+  }
+
+  return Object.freeze({ conserveRatio, criticalRatio })
+}
+
+function adaptiveRuntimeUnavailable() {
+  return new TypeError(
+    'dsh-budget-tracker: adaptive promptMode requires admission-time systemPrompt.refreshContext()',
+  )
+}
+
+/**
+ * Register stable system-prompt guidance and, on capable Harness builds, the
+ * admission-refreshed adaptive runtime context. Older runtimes remain supported
+ * for non-adaptive prompt modes; adaptive mode is rejected instead of falling
+ * back to a plugin-owned policy-message protocol.
+ */
+function registerPrompt(ctx, config, adaptiveGuidanceByAgent, runtimeCapabilities) {
   ctx.inject(['systemPrompt'], (inner) => {
     inner.effect(() => inner.systemPrompt.section({
       name: PROMPT_SECTION_NAME,
@@ -63,6 +130,22 @@ function registerPrompt(ctx, config) {
       text: () => resolvePromptText(currentPromptMode(config)) ?? '',
       interpolate: false,
     }), 'dsh-budget-tracker system prompt')
+
+    runtimeCapabilities.admissionContextRefresh =
+      'refreshContext' in inner.systemPrompt
+      && typeof inner.systemPrompt.refreshContext === 'function'
+
+    if (!runtimeCapabilities.admissionContextRefresh) {
+      if (currentPromptMode(config) === 'adaptive') throw adaptiveRuntimeUnavailable()
+      return
+    }
+
+    inner.effect(() => inner.systemPrompt.context({
+      name: ADAPTIVE_POLICY_CONTEXT_NAME,
+      order: ADAPTIVE_POLICY_CONTEXT_ORDER,
+      text: context => adaptiveGuidanceByAgent.get(context?.agent) ?? '',
+      interpolate: false,
+    }), 'dsh-budget-tracker adaptive runtime context')
   })
 }
 
@@ -72,6 +155,7 @@ function registerSettingsPresentation(ctx) {
     child.effect(() => child.settings.configure({ auto: false }, ctx.fiber))
   })
 }
+
 // The tracker intentionally follows dsh-compaction-basic's pressure semantics:
 // the active compaction service for its resolved policy, the LLM service for
 // the current routed model capacity, and tokenMeter for the exact pressure
@@ -169,7 +253,37 @@ export function calculateContextRemaining(thresholdTokens, currentPressureTokens
   return Math.max(0, Math.floor(thresholdTokens - currentPressureTokens))
 }
 
-/** Build one immutable source-attributed context message without runtime deps. */
+/**
+ * Resolve the adaptive pressure band from the relative remaining budget.
+ *
+ * The cutoffs are hidden runtime experiment policy, not part of the meaning of
+ * context_remaining. The exact current ratio is authoritative; no hysteresis
+ * or transition-specific threshold logic is applied.
+ *
+ * @param {number | undefined} contextRemaining
+ * @param {number | undefined} thresholdTokens
+ * @param {{ conserveRatio: number, criticalRatio: number }} adaptivePolicy
+ * @returns {'ample' | 'conserve' | 'critical' | undefined}
+ */
+export function resolveAdaptiveBand(
+  contextRemaining,
+  thresholdTokens,
+  adaptivePolicy = DEFAULT_ADAPTIVE_POLICY,
+) {
+  if (!Number.isInteger(contextRemaining) || !Number.isInteger(thresholdTokens)) {
+    return undefined
+  }
+  if (thresholdTokens <= 0 || contextRemaining < 0 || contextRemaining > thresholdTokens) {
+    return undefined
+  }
+
+  const remainingRatio = contextRemaining / thresholdTokens
+  if (remainingRatio <= adaptivePolicy.criticalRatio) return 'critical'
+  if (remainingRatio <= adaptivePolicy.conserveRatio) return 'conserve'
+  return 'ample'
+}
+
+/** Build one immutable budget snapshot message without runtime dependencies. */
 function createBudgetMessage(text) {
   const section = Object.freeze({ name: 'budget-tracker:context-remaining', text })
   const source = Object.freeze({
@@ -220,8 +334,8 @@ function serviceForAgent(ctx, agent, serviceName) {
     ?? ctx.get?.(serviceName)
 }
 
-/** Resolve the model-visible remaining budget after downstream pre-step work. */
-async function contextRemainingText(ctx, agent, signal) {
+/** Resolve the post-downstream budget state used by both model-visible outputs. */
+async function resolveBudgetState(ctx, agent, signal) {
   const compaction = serviceForAgent(ctx, agent, 'compaction')
   const llm = serviceForAgent(ctx, agent, 'llm')
   const tokenMeter = serviceForAgent(ctx, agent, 'tokenMeter')
@@ -263,7 +377,13 @@ async function contextRemainingText(ctx, agent, signal) {
   // performed by downstream pre-step listeners is already reflected here.
   const currentPressureTokens = tokenMeter.measure(agent.session).totalTokens
   const remaining = calculateContextRemaining(thresholdTokens, currentPressureTokens)
-  return remaining === undefined ? undefined : `context_remaining: ${remaining}`
+  if (remaining === undefined) return undefined
+
+  return {
+    thresholdTokens,
+    remaining,
+    text: `context_remaining: ${remaining}`,
+  }
 }
 
 /**
@@ -271,26 +391,45 @@ async function contextRemainingText(ctx, agent, signal) {
  *
  * The prepended listener wraps the complete pre-step chain. It computes after
  * next(), so any dsh-compaction-basic pruning/compaction in that chain lands
- * before the model-visible budget snapshot is measured.
+ * before both the budget snapshot and the runtime-context policy are resolved.
  */
 export function apply(ctx, config = {}) {
-  registerPrompt(ctx, config)
+  const adaptivePolicy = resolveAdaptivePolicyConfig(config)
+  const adaptiveGuidanceByAgent = new WeakMap()
+  const runtimeCapabilities = { admissionContextRefresh: undefined }
+  registerPrompt(ctx, config, adaptiveGuidanceByAgent, runtimeCapabilities)
   registerSettingsPresentation(ctx)
 
   return ctx.on('agent/pre-step', async (
     { agent, signal },
     next,
   ) => {
+    // Capture the mode at listener entry so the static prompt assembled just
+    // before pre-step and the dynamic policy decision use one configuration.
+    const promptMode = currentPromptMode(config)
+    if (promptMode === 'adaptive' && runtimeCapabilities.admissionContextRefresh !== true) {
+      throw adaptiveRuntimeUnavailable()
+    }
+
     const decision = await next()
     if (decision.kind === 'reject' || signal?.aborted) return decision
 
-    const text = await contextRemainingText(ctx, agent, signal)
-    if (text === undefined || signal?.aborted) return decision
-    if (retainedBudgetText(agent.session) === text) return decision
+    const budget = await resolveBudgetState(ctx, agent, signal)
+    if (signal?.aborted) return decision
+
+    const band = promptMode === 'adaptive' && budget !== undefined
+      ? resolveAdaptiveBand(budget.remaining, budget.thresholdTokens, adaptivePolicy)
+      : undefined
+
+    adaptiveGuidanceByAgent.set(agent, resolveAdaptivePolicyText(band) ?? '')
+
+    if (budget === undefined || retainedBudgetText(agent.session) === budget.text) {
+      return decision
+    }
 
     return {
       ...decision,
-      messages: [...decision.messages, createBudgetMessage(text)],
+      messages: [...decision.messages, createBudgetMessage(budget.text)],
     }
   }, { prepend: true })
 }
