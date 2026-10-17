@@ -375,8 +375,8 @@ function serviceForAgent(ctx, agent, serviceName) {
     ?? ctx.get?.(serviceName)
 }
 
-/** Resolve the post-downstream budget state used by both model-visible outputs. */
-async function resolveBudgetState(ctx, agent, signal, representation) {
+/** Resolve the post-downstream canonical budget state shared by all consumers. */
+async function resolveBudgetState(ctx, agent, signal) {
   const compaction = serviceForAgent(ctx, agent, 'compaction')
   const llm = serviceForAgent(ctx, agent, 'llm')
   const tokenMeter = serviceForAgent(ctx, agent, 'tokenMeter')
@@ -420,13 +420,9 @@ async function resolveBudgetState(ctx, agent, signal, representation) {
   const remaining = calculateContextRemaining(thresholdTokens, currentPressureTokens)
   if (remaining === undefined) return undefined
 
-  const text = formatBudgetText(remaining, thresholdTokens, representation)
-  if (text === undefined) return undefined
-
   return {
     thresholdTokens,
     remaining,
-    text,
   }
 }
 
@@ -459,8 +455,12 @@ export function apply(ctx, config = {}) {
     const decision = await next()
     if (decision.kind === 'reject' || signal?.aborted) return decision
 
-    const budget = await resolveBudgetState(ctx, agent, signal, budgetRepresentation)
+    const budget = await resolveBudgetState(ctx, agent, signal)
     if (signal?.aborted) return decision
+
+    const budgetText = budget === undefined
+      ? undefined
+      : formatBudgetText(budget.remaining, budget.thresholdTokens, budgetRepresentation)
 
     const band = promptMode === 'adaptive' && budget !== undefined
       ? resolveAdaptiveBand(budget.remaining, budget.thresholdTokens, adaptivePolicy)
@@ -468,13 +468,13 @@ export function apply(ctx, config = {}) {
 
     adaptiveGuidanceByAgent.set(agent, resolveAdaptivePolicyText(band) ?? '')
 
-    if (budget === undefined || retainedBudgetText(agent.session) === budget.text) {
+    if (budgetText === undefined || retainedBudgetText(agent.session) === budgetText) {
       return decision
     }
 
     return {
       ...decision,
-      messages: [...decision.messages, createBudgetMessage(budget.text)],
+      messages: [...decision.messages, createBudgetMessage(budgetText)],
     }
   }, { prepend: true })
 }
