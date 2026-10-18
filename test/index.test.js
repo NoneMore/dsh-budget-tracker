@@ -20,16 +20,17 @@ import {
   resolvePressurePolicy,
 } from '../index.js'
 
-test('declares DeepSeek Harness 0.2 runtime compatibility', () => {
+test('declares DSH 0.2.1 RC compatibility without dropping 0.2.0 RC support', () => {
   const manifest = JSON.parse(
     readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
   )
+  const supportedDsh = '>=0.2.0-rc.2 <0.2.1 || >=0.2.1-rc.2 <0.3.0'
 
+  assert.equal(manifest.version, '0.3.1')
   assert.equal(manifest.engines.node, '^22.19.0 || >=24.0.0')
-  assert.equal(
-    manifest.peerDependencies['@deepseek-ai/dsh'],
-    '>=0.2.0-rc.2 <0.3.0',
-  )
+  assert.equal(manifest.engines.dsh, supportedDsh)
+  assert.equal(manifest.peerDependencies['@deepseek-ai/dsh'], supportedDsh)
+  assert.equal(manifest.dsh.manifestVersion, 1)
   assert.equal(manifest.dependencies['@deepseek-ai/schemastery'], '^3.18.4')
   assert.equal(manifest.exports['./client'], './client.js')
 })
