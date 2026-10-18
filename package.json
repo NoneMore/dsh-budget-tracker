@@ -25,10 +25,10 @@
   "license": "MIT",
   "engines": {
     "node": "^22.19.0 || >=24.0.0",
-    "dsh": ">=0.2.0-rc.2 <0.2.1 || >=0.2.1-rc.2 <0.3.0"
+    "dsh": ">=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-rc.2 <0.3.0-0"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh": ">=0.2.0-rc.2 <0.2.1 || >=0.2.1-rc.2 <0.3.0"
+    "@deepseek-ai/dsh": ">=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-rc.2 <0.3.0-0"
   },
   "repository": {
     "type": "git",
@@ -58,5 +58,8 @@
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.4"
+  },
+  "devDependencies": {
+    "semver": "^7.7.3"
   }
 }
