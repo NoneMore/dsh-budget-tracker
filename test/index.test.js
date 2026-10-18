@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import semver from 'semver'
 import {
   apply,
   inject,
@@ -20,18 +21,37 @@ import {
   resolvePressurePolicy,
 } from '../index.js'
 
-test('declares DeepSeek Harness 0.2 runtime compatibility', () => {
+test('declares DSH 0.2.1 RC compatibility without dropping 0.2.0 RC support', () => {
   const manifest = JSON.parse(
     readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
   )
+  const supportedDsh = '>=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-rc.2 <0.3.0-0'
 
+  assert.equal(manifest.version, '0.4.0')
   assert.equal(manifest.engines.node, '^22.19.0 || >=24.0.0')
-  assert.equal(
-    manifest.peerDependencies['@deepseek-ai/dsh'],
-    '>=0.2.0-rc.2 <0.3.0',
-  )
+  assert.equal(manifest.engines.dsh, supportedDsh)
+  assert.equal(manifest.peerDependencies['@deepseek-ai/dsh'], supportedDsh)
+  assert.equal(manifest.dsh.manifestVersion, 1)
   assert.equal(manifest.dependencies['@deepseek-ai/schemastery'], '^3.18.4')
   assert.equal(manifest.exports['./client'], './client.js')
+})
+
+
+test('RC compatibility agrees with npm and Harness prerelease matching', () => {
+  const manifest = JSON.parse(
+    readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+  )
+  const range = manifest.engines.dsh
+
+  for (const version of ['0.2.0-rc.2', '0.2.0', '0.2.1-rc.2', '0.2.1-rc.3', '0.2.1', '0.2.2']) {
+    assert.equal(semver.satisfies(version, range), true, `npm: ${version}`)
+    assert.equal(semver.satisfies(version, range, { includePrerelease: true }), true, `DSH: ${version}`)
+  }
+
+  for (const version of ['0.2.0-rc.1', '0.2.1-alpha.5', '0.2.1-rc.1', '0.3.0-rc.1', '0.3.0']) {
+    assert.equal(semver.satisfies(version, range), false, `npm: ${version}`)
+    assert.equal(semver.satisfies(version, range, { includePrerelease: true }), false, `DSH: ${version}`)
+  }
 })
 
 test('only requires the host-level agent registry service', () => {
