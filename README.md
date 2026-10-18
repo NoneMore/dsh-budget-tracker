@@ -18,16 +18,20 @@ No search budget, browse budget, pressure label, or second model-visible budget 
 
 ## Compatibility
 
-Version 0.3.0 targets DeepSeek Harness 0.2.x starting with
-`dsh-v0.2.0-rc.2`.
+Version 0.3.1 supports the latest DeepSeek Harness release candidate,
+`dsh-v0.2.1-rc.2`, while retaining support for `dsh-v0.2.0-rc.2` and
+later 0.2.0 builds.
 
 ```text
-DeepSeek Harness: >=0.2.0-rc.2 <0.3.0
+DeepSeek Harness: >=0.2.0-rc.2 <0.2.1 || >=0.2.1-rc.2 <0.3.0
 Node.js:          ^22.19.0 || >=24.0.0
 ```
 
-The package declares `@deepseek-ai/dsh` as a peer dependency so Harness 0.2's
-plugin compatibility gate can reject an incompatible runtime before activation.
+The two-part range is intentional: SemVer excludes prereleases of a *new*
+patch version unless its comparator explicitly names that patch's prerelease.
+The older `>=0.2.0-rc.2 <0.3.0` range does **not** accept `0.2.1-rc.2`.
+Both `engines.dsh` (preferred by DSH 0.2.1's plugin compatibility checks)
+and the legacy `@deepseek-ai/dsh` peer dependency declare the same range.
 Profile installations use the Harness-provided runtime; the plugin does not
 bundle a second DSH copy.
 
@@ -39,10 +43,10 @@ Harness line.
 
 `adaptive` additionally requires admission-time `systemPrompt.refreshContext()`
 so its policy can be selected from the same post-compaction state as
-`context_remaining`. `dsh-v0.2.0-rc.2` does not provide that admission refresh;
-on such a runtime the plugin keeps the non-adaptive modes available but rejects
-`adaptive` explicitly instead of falling back to a plugin-owned policy-message
-protocol.
+`context_remaining`. `dsh-v0.2.1-rc.2` provides that refresh, making the
+adaptive mode available on the latest RC. `dsh-v0.2.0-rc.2` does not; on
+that older runtime the non-adaptive modes remain usable, but selecting
+`adaptive` fails explicitly instead of using a stale policy-message fallback.
 
 ## What `context_remaining` means
 
@@ -103,7 +107,7 @@ On DSH Web, presets that enable compaction (including the shipped `standard`, `p
 
 The tracker installs a prepended `agent/pre-step` wrapper and computes only after `next()` returns. This means any downstream pruning or proactive compaction has already completed before `context_remaining` and the adaptive band are measured. A step that compacts therefore sees the **post-compaction** remaining budget, not the stale value that triggered compaction.
 
-On Harness builds that expose admission-time `systemPrompt.refreshContext()`, adaptive guidance is contributed through `systemPrompt.context()`. Harness refreshes that registered context after pre-step, so the guidance used for request admission is derived from the same post-compaction state as the budget snapshot.
+On Harness `dsh-v0.2.1-rc.2` (and builds with the same admission-time `systemPrompt.refreshContext()` API), adaptive guidance is contributed through `systemPrompt.context()`. Harness refreshes that registered context after pre-step, so the guidance used for request admission is derived from the same post-compaction state as the budget snapshot.
 
 On a supported Harness runtime without admission-time refresh, non-adaptive modes continue to work normally. Selecting `adaptive` fails explicitly because using pre-step-stale runtime context would violate its same-step post-compaction semantics.
 
