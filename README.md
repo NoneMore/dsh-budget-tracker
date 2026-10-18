@@ -18,7 +18,7 @@ No search budget, browse budget, pressure label, or second model-visible budget 
 
 ## Compatibility
 
-Version 0.3.1 supports the latest DeepSeek Harness release candidate,
+Version 0.4.0 supports the latest DeepSeek Harness release candidate,
 `dsh-v0.2.1-rc.2`, while retaining support for `dsh-v0.2.0-rc.2` and
 later 0.2.0 builds.
 
