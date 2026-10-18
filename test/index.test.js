@@ -26,7 +26,7 @@ test('declares DSH 0.2.1 RC compatibility without dropping 0.2.0 RC support', ()
   )
   const supportedDsh = '>=0.2.0-rc.2 <0.2.1 || >=0.2.1-rc.2 <0.3.0'
 
-  assert.equal(manifest.version, '0.3.1')
+  assert.equal(manifest.version, '0.4.0')
   assert.equal(manifest.engines.node, '^22.19.0 || >=24.0.0')
   assert.equal(manifest.engines.dsh, supportedDsh)
   assert.equal(manifest.peerDependencies['@deepseek-ai/dsh'], supportedDsh)
