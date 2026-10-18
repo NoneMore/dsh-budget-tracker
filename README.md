@@ -23,13 +23,16 @@ Version 0.4.0 supports the latest DeepSeek Harness release candidate,
 later 0.2.0 builds.
 
 ```text
-DeepSeek Harness: >=0.2.0-rc.2 <0.2.1 || >=0.2.1-rc.2 <0.3.0
+DeepSeek Harness: >=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-rc.2 <0.3.0-0
 Node.js:          ^22.19.0 || >=24.0.0
 ```
 
-The two-part range is intentional: SemVer excludes prereleases of a *new*
-patch version unless its comparator explicitly names that patch's prerelease.
-The older `>=0.2.0-rc.2 <0.3.0` range does **not** accept `0.2.1-rc.2`.
+The two-part range is intentional. npm's default SemVer matching would
+exclude `0.2.1-rc.2` from the old `>=0.2.0-rc.2 <0.3.0` peer range.
+Harness's plugin compatibility gate uses `includePrerelease: true`, however,
+so the old range already admitted that RC in the gate. The new range explicitly
+expresses both supported RC floors and uses `-0` upper bounds to avoid
+admitting unsupported `0.2.1` prereleases before `rc.2` or `0.3.0` prereleases.
 Both `engines.dsh` (preferred by DSH 0.2.1's plugin compatibility checks)
 and the legacy `@deepseek-ai/dsh` peer dependency declare the same range.
 Profile installations use the Harness-provided runtime; the plugin does not
