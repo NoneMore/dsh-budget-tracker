@@ -627,8 +627,8 @@ test('all non-adaptive modes emit one factual alert with no guidance', async () 
       mode,
     )
 
-    // Cooldown: do not re-emit a notice on the next admission.
-    harness.setAfterTokens(185_000)
+    // Cooldown: even another large drop must not re-emit on the next step.
+    harness.setAfterTokens(230_000)
     const next = await harness.run()
     assert.equal(next.messages.some(m => m.source?.form === 'surge-notice'), false, mode)
     assert.equal(harness.policyText(), '', mode)
