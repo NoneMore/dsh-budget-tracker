@@ -675,7 +675,7 @@ test('critical pressure remains the dominant guidance even during a surge', asyn
 test('surge notice formatting is factual and contains no prescriptive text', () => {
   const single = formatSurgeNotice({ spanSteps: 1, spentRatio: 0.05, remainingRatio: 0.775 })
   const rolling = formatSurgeNotice({ spanSteps: 5, spentRatio: 0.075, remainingRatio: 0.30 })
-  assert.match(single, /5\\.0%.*1 step/)
-  assert.match(rolling, /7\\.5%.*5 steps/)
+  assert.match(single, /5\.0%.*1 step/)
+  assert.match(rolling, /7\.5%.*5 steps/)
   assert.doesNotMatch(single, /reassess|should|must|prioritize|prefer|reduce/i)
 })
