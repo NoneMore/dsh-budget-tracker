@@ -17,6 +17,7 @@ import {
   resolveAdaptivePolicyText,
   resolveAdaptiveBand,
   SURGE_GUIDANCE_TEXT,
+  formatSurgeNotice,
   calculateContextRemaining,
   calculateThresholdTokens,
   resolvePressurePolicy,
@@ -163,6 +164,7 @@ function integrationHarness({
   headerMaxTokens = 32_768,
   auto = true,
   retainedText,
+  retainedSurgeText,
   supportsAdmissionContextRefresh = true,
   scopedCompaction = true,
   hostCompaction = false,
@@ -182,12 +184,16 @@ function integrationHarness({
   let settingsConfigurePolicy
   const serviceLookups = []
 
-  const retained = retainedText === undefined
-    ? []
-    : [{ type: 'user/message', data: {
+  const retained = [
+    ...(retainedText === undefined ? [] : [{ type: 'user/message', data: {
       content: [{ type: 'text', text: retainedText }],
-      source: { kind: 'dsh-budget-tracker' },
-    } }]
+      source: { kind: 'dsh-budget-tracker', form: 'snapshot' },
+    } }]),
+    ...(retainedSurgeText === undefined ? [] : [{ type: 'user/message', data: {
+      content: [{ type: 'text', text: retainedSurgeText }],
+      source: { kind: 'dsh-budget-tracker', form: 'surge-notice' },
+    } }]),
+  ]
 
   const session = {
     surface: { nodes: retained.map((_, index) => index) },
@@ -499,15 +505,21 @@ test('does not mutate policy state for a rejected pre-step', async () => {
   assert.equal(harness.policyText(), '')
 })
 
-test('adaptive surge warns early on a single large step without crossing the conserve band', async () => {
+test('adaptive surge sends a factual notice AND runtime guidance above conserve', async () => {
   const harness = integrationHarness({ promptMode: 'adaptive', afterTokens: 140_000 })
   await harness.run() // 82.5% remaining: establish baseline
   assert.equal(harness.policyText(), '')
 
   harness.setAfterTokens(180_000) // 77.5%, a 5-point single-step decrease
   const decision = await harness.run()
-  assert.equal(decision.messages.length, 1)
+  assert.equal(decision.messages.length, 2)
   assert.equal(decision.messages[0].content[0].text, 'context_remaining: 620000')
+  assert.equal(decision.messages[1].source.kind, 'dsh-budget-tracker')
+  assert.equal(decision.messages[1].source.form, 'surge-notice')
+  assert.equal(
+    decision.messages[1].content[0].text,
+    'context_usage_notice: rapid consumption (5.0% of proactive-compaction budget over 1 step); remaining 77.5%.',
+  )
   assert.equal(harness.policyText(), SURGE_GUIDANCE_TEXT)
 })
 
@@ -593,22 +605,77 @@ test('surge baseline resets when the effective compaction threshold changes', as
   assert.equal(harness.policyText(), SURGE_GUIDANCE_TEXT)
 })
 
-test('surge only affects adaptive mode and does not add new snapshot fields', async () => {
-  const harness = integrationHarness({ promptMode: 'planning', afterTokens: 140_000 })
+test('all non-adaptive modes emit one factual alert with no guidance', async () => {
+  for (const mode of ['none', 'semantic', 'planning', 'behavioral']) {
+    const harness = integrationHarness({
+      promptMode: mode,
+      afterTokens: 140_000,
+      supportsAdmissionContextRefresh: false,
+    })
+    await harness.run()
+    harness.setAfterTokens(180_000)
+    const decision = await harness.run()
+    assert.equal(harness.policyText(), '', mode)
+    assert.equal(decision.messages.length, 2, mode)
+    assert.deepEqual(decision.messages[0].content, [
+      { type: 'text', text: 'context_remaining: 620000' },
+    ])
+    assert.equal(decision.messages[1].source.form, 'surge-notice', mode)
+    assert.equal(
+      decision.messages[1].content[0].text,
+      'context_usage_notice: rapid consumption (5.0% of proactive-compaction budget over 1 step); remaining 77.5%.',
+      mode,
+    )
+
+    // Cooldown: do not re-emit a notice on the next admission.
+    harness.setAfterTokens(185_000)
+    const next = await harness.run()
+    assert.equal(next.messages.some(m => m.source?.form === 'surge-notice'), false, mode)
+    assert.equal(harness.policyText(), '', mode)
+  }
+})
+
+test('surge notice is not mistaken for the latest retained budget snapshot', async () => {
+  const harness = integrationHarness({
+    promptMode: 'semantic',
+    retainedText: 'context_remaining: 500000',
+    retainedSurgeText: 'context_usage_notice: previous trigger',
+    afterTokens: 300_000,
+  })
+  assert.deepEqual(await harness.run(), { kind: 'enter', messages: [] })
+})
+
+test('all modes can detect rolling burn without an individual step spike', async () => {
+  const harness = integrationHarness({ promptMode: 'semantic', afterTokens: 500_000 })
   await harness.run()
-  harness.setAfterTokens(180_000)
+  for (let index = 1; index < 5; index += 1) {
+    harness.setAfterTokens(500_000 + 12_000 * index)
+    const decision = await harness.run()
+    assert.equal(decision.messages.some(m => m.source?.form === 'surge-notice'), false)
+  }
+  harness.setAfterTokens(560_000)
   const decision = await harness.run()
+  assert.equal(decision.messages.filter(m => m.source?.form === 'surge-notice').length, 1)
+  assert.equal(
+    decision.messages.find(m => m.source?.form === 'surge-notice').content[0].text,
+    'context_usage_notice: rapid consumption (7.5% of proactive-compaction budget over 5 steps); remaining 30.0%.',
+  )
   assert.equal(harness.policyText(), '')
-  assert.equal(decision.messages.length, 1)
-  assert.deepEqual(decision.messages[0].content, [
-    { type: 'text', text: 'context_remaining: 620000' },
-  ])
 })
 
 test('critical pressure remains the dominant guidance even during a surge', async () => {
   const harness = integrationHarness({ promptMode: 'adaptive', afterTokens: 700_000 })
   await harness.run() // remaining 12.5%
   harness.setAfterTokens(740_000) // remaining 7.5%, single-step surge
-  await harness.run()
+  const decision = await harness.run()
   assert.equal(harness.policyText(), resolveAdaptivePolicyText('critical'))
+  assert.equal(decision.messages.filter(m => m.source?.form === 'surge-notice').length, 1)
+})
+
+test('surge notice formatting is factual and contains no prescriptive text', () => {
+  const single = formatSurgeNotice({ spanSteps: 1, spentRatio: 0.05, remainingRatio: 0.775 })
+  const rolling = formatSurgeNotice({ spanSteps: 5, spentRatio: 0.075, remainingRatio: 0.30 })
+  assert.match(single, /5\\.0%.*1 step/)
+  assert.match(rolling, /7\\.5%.*5 steps/)
+  assert.doesNotMatch(single, /reassess|should|must|prioritize|prefer|reduce/i)
 })
