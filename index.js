@@ -389,8 +389,8 @@ export function detectBudgetSurge(history, currentRemaining, thresholdTokens, po
 /**
  * Per-agent, ephemeral surge state. A compaction/pruning increase, route change,
  * or effective threshold change starts a fresh baseline instead of comparing
- * incomparable snapshots. The event persists briefly in cache-safe runtime
- * context, with cooldown preventing repeated warning pulses.
+ * incomparable snapshots. A new alert is emitted only on a trigger; adaptive
+ * guidance may remain active briefly, with cooldown preventing repeated pulses.
  */
 export function advanceSurgeState(previous, budget, policy = DEFAULT_SURGE_POLICY) {
   const lastRemaining = previous?.history.at(-1)
@@ -410,15 +410,34 @@ export function advanceSurgeState(previous, budget, policy = DEFAULT_SURGE_POLIC
   }
   state.step += 1
 
+  let alert
   if (state.step - state.lastAlertStep >= policy.cooldownSteps
     && detectBudgetSurge(state.history, budget.remaining, budget.thresholdTokens, policy)) {
     state.lastAlertStep = state.step
     state.activeUntilStep = state.step + policy.activeSteps - 1
+
+    const previousRemaining = state.history.at(-1)
+    const singleDrop = (previousRemaining - budget.remaining) / budget.thresholdTokens
+    const isSingle = singleDrop >= policy.stepDropRatio
+      && budget.remaining / budget.thresholdTokens <= policy.stepMaxRemainingRatio
+    const spanSteps = isSingle ? 1 : policy.windowSteps
+    const baseline = state.history[state.history.length - spanSteps]
+    alert = {
+      spanSteps,
+      spentRatio: (baseline - budget.remaining) / budget.thresholdTokens,
+      remainingRatio: budget.remaining / budget.thresholdTokens,
+    }
   }
 
   state.history.push(budget.remaining)
   if (state.history.length > policy.windowSteps) state.history.shift()
-  return { state, active: state.step <= state.activeUntilStep }
+  return { state, active: state.step <= state.activeUntilStep, alert }
+}
+
+/** A factual signal only: no imperative, task strategy, or prescribed action. */
+export function formatSurgeNotice({ spanSteps, spentRatio, remainingRatio }) {
+  const steps = spanSteps === 1 ? 'step' : 'steps'
+  return `context_usage_notice: rapid consumption (${(spentRatio * 100).toFixed(1)}% of proactive-compaction budget over ${spanSteps} ${steps}); remaining ${(remainingRatio * 100).toFixed(1)}%.`
 }
 
 /** Build one immutable budget snapshot message without runtime dependencies. */
@@ -437,13 +456,30 @@ function createBudgetMessage(text) {
   })
 }
 
-/** Return the newest retained budget snapshot text, if one survives. */
+/** Emit a source-attributed one-off notice without coupling it to promptMode. */
+function createSurgeNotice(text) {
+  const section = Object.freeze({ name: 'budget-tracker:consumption-notice', text })
+  const source = Object.freeze({
+    kind: name,
+    form: 'surge-notice',
+    sections: Object.freeze([section]),
+  })
+  return Object.freeze({
+    id: randomUUID(),
+    role: 'user',
+    content: Object.freeze([Object.freeze({ type: 'text', text })]),
+    source,
+  })
+}
+
+/** Return the newest retained budget snapshot text, ignoring surge notices. */
 function retainedBudgetText(session) {
   const nodes = session?.surface?.nodes
   if (!nodes || typeof session.eventAt !== 'function') return undefined
   for (let index = nodes.length - 1; index >= 0; index -= 1) {
     const event = session.eventAt(nodes[index])
-    if (event?.type !== 'user/message' || event.data?.source?.kind !== name) continue
+    if (event?.type !== 'user/message' || event.data?.source?.kind !== name
+      || event.data?.source?.form === 'surge-notice') continue
     const [block] = event.data.content ?? []
     return event.data.content?.length === 1 && block?.type === 'text'
       ? block.text
@@ -567,30 +603,34 @@ export function apply(ctx, config = {}) {
       ? resolveAdaptiveBand(budget.remaining, budget.thresholdTokens, adaptivePolicy)
       : undefined
 
-    let surgeActive = false
-    if (promptMode === 'adaptive' && budget !== undefined) {
-      const surge = advanceSurgeState(surgeStateByAgent.get(agent), budget, surgePolicy)
+    // Detection and factual notification apply to every mode, including none.
+    // Only adaptive turns this same signal into behavioral guidance.
+    let surge
+    if (budget !== undefined) {
+      surge = advanceSurgeState(surgeStateByAgent.get(agent), budget, surgePolicy)
       surgeStateByAgent.set(agent, surge.state)
-      surgeActive = surge.active
     } else {
       surgeStateByAgent.delete(agent)
     }
 
-    // A critical band already says to finish and verify; avoid stacking
-    // another warning on top. All other modes keep their previous behavior.
-    const guidance = [
-      resolveAdaptivePolicyText(band) ?? '',
-      surgeActive && band !== 'critical' ? SURGE_GUIDANCE_TEXT : '',
-    ].filter(Boolean).join('\n')
+    // Critical adaptive guidance already prioritizes finishing. Non-adaptive
+    // modes never receive behavioral guidance, only a factual notice event.
+    const guidance = promptMode === 'adaptive'
+      ? [
+          resolveAdaptivePolicyText(band) ?? '',
+          surge?.active && band !== 'critical' ? SURGE_GUIDANCE_TEXT : '',
+        ].filter(Boolean).join('\n')
+      : ''
     adaptiveGuidanceByAgent.set(agent, guidance)
 
-    if (budgetText === undefined || retainedBudgetText(agent.session) === budgetText) {
-      return decision
+    const messages = [...decision.messages]
+    if (budgetText !== undefined && retainedBudgetText(agent.session) !== budgetText) {
+      messages.push(createBudgetMessage(budgetText))
     }
-
-    return {
-      ...decision,
-      messages: [...decision.messages, createBudgetMessage(budgetText)],
+    if (surge?.alert) {
+      messages.push(createSurgeNotice(formatSurgeNotice(surge.alert)))
     }
+    if (messages.length === decision.messages.length) return decision
+    return { ...decision, messages }
   }, { prepend: true })
 }
