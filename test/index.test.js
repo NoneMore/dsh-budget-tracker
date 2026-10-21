@@ -16,6 +16,7 @@ import {
   resolvePromptText,
   resolveAdaptivePolicyText,
   resolveAdaptiveBand,
+  SURGE_GUIDANCE_TEXT,
   calculateContextRemaining,
   calculateThresholdTokens,
   resolvePressurePolicy,
@@ -172,6 +173,7 @@ function integrationHarness({
 } = {}) {
   let currentTokens = beforeTokens
   let downstreamTokens = afterTokens
+  let routedModel = 'model'
   let listener
   let options
   let promptSection
@@ -193,7 +195,7 @@ function integrationHarness({
     requestHeader: () => ({
       config: {
         provider: 'deepseek',
-        model: 'model',
+        model: routedModel,
         ...(headerMaxTokens == null ? {} : { maxTokens: headerMaxTokens }),
       },
     }),
@@ -303,6 +305,8 @@ function integrationHarness({
     hasPolicyContext: () => policyContext !== undefined,
     policyText: () => policyContext?.text({ agent }) ?? '',
     setAfterTokens: value => { downstreamTokens = value },
+    setRoutedModel: value => { routedModel = value },
+    setThresholdRatio: value => { compaction.config.thresholdRatio = value },
     run: async ({ reject = false } = {}) => listener(
       { agent, signal: new AbortController().signal },
       async () => {
@@ -493,4 +497,118 @@ test('does not mutate policy state for a rejected pre-step', async () => {
   const harness = integrationHarness({ promptMode: 'adaptive', afterTokens: 730_000 })
   assert.deepEqual(await harness.run({ reject: true }), { kind: 'reject' })
   assert.equal(harness.policyText(), '')
+})
+
+test('adaptive surge warns early on a single large step without crossing the conserve band', async () => {
+  const harness = integrationHarness({ promptMode: 'adaptive', afterTokens: 140_000 })
+  await harness.run() // 82.5% remaining: establish baseline
+  assert.equal(harness.policyText(), '')
+
+  harness.setAfterTokens(180_000) // 77.5%, a 5-point single-step decrease
+  const decision = await harness.run()
+  assert.equal(decision.messages.length, 1)
+  assert.equal(decision.messages[0].content[0].text, 'context_remaining: 620000')
+  assert.equal(harness.policyText(), SURGE_GUIDANCE_TEXT)
+})
+
+test('adaptive surge detects sustained burn across five small steps', async () => {
+  const harness = integrationHarness({ promptMode: 'adaptive', afterTokens: 500_000 })
+  await harness.run() // 37.5% remaining
+  for (let index = 1; index < 5; index += 1) {
+    harness.setAfterTokens(500_000 + 12_000 * index)
+    await harness.run()
+    assert.equal(harness.policyText(), '')
+  }
+  harness.setAfterTokens(560_000) // 30% remaining, 7.5 points in five steps
+  await harness.run()
+  assert.equal(harness.policyText(), SURGE_GUIDANCE_TEXT)
+})
+
+test('surge warning persists for three steps and respects its five-step cooldown', async () => {
+  const harness = integrationHarness({ promptMode: 'adaptive', afterTokens: 160_000 })
+  await harness.run()
+  harness.setAfterTokens(190_000)
+  await harness.run() // step 2: trigger
+  assert.equal(harness.policyText(), SURGE_GUIDANCE_TEXT)
+
+  await harness.run() // step 3: still active
+  assert.equal(harness.policyText(), SURGE_GUIDANCE_TEXT)
+  await harness.run() // step 4: still active
+  assert.equal(harness.policyText(), SURGE_GUIDANCE_TEXT)
+  await harness.run() // step 5: expired
+  assert.equal(harness.policyText(), '')
+
+  harness.setAfterTokens(230_000)
+  await harness.run() // step 6: drop is large, but cooldown applies
+  assert.equal(harness.policyText(), '')
+  harness.setAfterTokens(261_000)
+  await harness.run() // step 7: cooldown has passed
+  assert.equal(harness.policyText(), SURGE_GUIDANCE_TEXT)
+})
+
+test('surge baseline resets on compaction or pruning that increases remaining tokens', async () => {
+  const harness = integrationHarness({ promptMode: 'adaptive', afterTokens: 450_000 })
+  await harness.run()
+  harness.setAfterTokens(480_000)
+  await harness.run()
+  assert.equal(harness.policyText(), SURGE_GUIDANCE_TEXT)
+
+  harness.setAfterTokens(150_000) // simulated compaction: remaining jumps upward
+  await harness.run()
+  assert.equal(harness.policyText(), '')
+  harness.setAfterTokens(158_000)
+  await harness.run()
+  assert.equal(harness.policyText(), '')
+})
+
+test('surge baseline resets when the model route changes even with equal capacity', async () => {
+  const harness = integrationHarness({ promptMode: 'adaptive', afterTokens: 120_000 })
+  await harness.run()
+  harness.setAfterTokens(180_000)
+  await harness.run()
+  assert.equal(harness.policyText(), SURGE_GUIDANCE_TEXT)
+
+  harness.setRoutedModel('another-model')
+  harness.setAfterTokens(200_000)
+  await harness.run()
+  assert.equal(harness.policyText(), '')
+  harness.setAfterTokens(232_000)
+  await harness.run()
+  assert.equal(harness.policyText(), SURGE_GUIDANCE_TEXT)
+})
+
+test('surge baseline resets when the effective compaction threshold changes', async () => {
+  const harness = integrationHarness({ promptMode: 'adaptive', afterTokens: 150_000 })
+  await harness.run()
+  harness.setAfterTokens(190_000)
+  await harness.run()
+  assert.equal(harness.policyText(), SURGE_GUIDANCE_TEXT)
+
+  harness.setThresholdRatio(0.7)
+  harness.setAfterTokens(215_000)
+  await harness.run() // new 700k threshold; new baseline
+  assert.equal(harness.policyText(), '')
+  harness.setAfterTokens(240_000)
+  await harness.run()
+  assert.equal(harness.policyText(), SURGE_GUIDANCE_TEXT)
+})
+
+test('surge only affects adaptive mode and does not add new snapshot fields', async () => {
+  const harness = integrationHarness({ promptMode: 'planning', afterTokens: 140_000 })
+  await harness.run()
+  harness.setAfterTokens(180_000)
+  const decision = await harness.run()
+  assert.equal(harness.policyText(), '')
+  assert.equal(decision.messages.length, 1)
+  assert.deepEqual(decision.messages[0].content, [
+    { type: 'text', text: 'context_remaining: 620000' },
+  ])
+})
+
+test('critical pressure remains the dominant guidance even during a surge', async () => {
+  const harness = integrationHarness({ promptMode: 'adaptive', afterTokens: 700_000 })
+  await harness.run() // remaining 12.5%
+  harness.setAfterTokens(740_000) // remaining 7.5%, single-step surge
+  await harness.run()
+  assert.equal(harness.policyText(), resolveAdaptivePolicyText('critical'))
 })
