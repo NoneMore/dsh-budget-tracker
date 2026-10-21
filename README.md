@@ -14,7 +14,7 @@ A hidden representation control can instead show the same budget normalized agai
 context_remaining: 190000 / 800000 (23.8%)
 ```
 
-No search budget, browse budget, pressure label, or second model-visible budget field is added. Optional prompt modes can explain the field, guide planning, or opt into an internal relative-pressure policy. Adaptive mode also detects sudden or sustained budget consumption before the low-budget cutoffs. None of these changes the budget calculation or Harness compaction policy.
+No search budget, browse budget, pressure label, or second model-visible budget field is added. Optional prompt modes can explain the field, guide planning, or opt into an internal relative-pressure policy. The tracker also detects sudden or sustained budget consumption in every prompt mode, with behavior guidance remaining adaptive-only. None of these changes the budget calculation or Harness compaction policy.
 
 ## Compatibility
 
@@ -153,15 +153,15 @@ Experiment observation is intentionally kept out of the runtime plugin. Comparat
 
 ## Prompt modes
 
-The dynamic budget snapshot and prompt guidance are deliberately separate. Configure `promptMode` on the plugin row:
+The dynamic budget snapshot, factual surge notices, and prompt guidance are deliberately separate. Every mode receives a factual notice when consumption spikes; only `adaptive` adds surge-specific behavioral guidance. Configure `promptMode` on the plugin row:
 
 | Mode | Behavior |
 | --- | --- |
 | `semantic` | **Default.** Static system prompt explaining that `context_remaining` is the budget before proactive compaction, not the model's absolute context-window remainder. |
 | `planning` | Includes the semantic explanation and asks the model to use the value as a context-pressure signal when deciding how much context to spend on the current response. |
 | `behavioral` | Builds on `planning` and statically guides context-conserving behavior as the budget decreases: prioritize essentials, avoid unnecessary restatement, keep intermediate outputs compact, and prefer finishing current work over opening large new lines of work. It still defines no numeric thresholds. |
-| `adaptive` | Uses the same static baseline as `planning`, then contributes pressure-specific and early burn-rate surge guidance through admission-refreshed Harness runtime context. Requires a runtime with `systemPrompt.refreshContext()`. |
-| `none` | Adds no static prompt guidance, matching the pre-prompt behavior of the plugin. |
+| `adaptive` | Uses the same static baseline as `planning`, then contributes pressure-specific and surge-specific behavioral guidance through admission-refreshed Harness runtime context. Requires a runtime with `systemPrompt.refreshContext()`. |
+| `none` | Adds no static prompt guidance. Still receives the normal budget snapshots and factual surge notices. |
 
 The bundled patch defaults to:
 
@@ -214,35 +214,45 @@ budget-tracker:adaptive-guidance
 
 Harness evaluates that provider again during admission refresh after pre-step. The contribution is:
 
-- empty in `ample`;
-- the conserve guidance in `conserve`;
-- the critical guidance in `critical`;
+- empty in `ample` unless surge guidance is temporarily active;
+- the conserve guidance in `conserve`, optionally with surge guidance;
+- the critical guidance in `critical` (without redundant surge guidance);
 - empty when adaptive mode is disabled or the current budget cannot be resolved.
 
 The contribution is intentionally optional rather than `required`, so a scope that suppresses optional runtime context also suppresses adaptive guidance. Harness owns replacement of older runtime-context snapshots, so the plugin does not emit neutral "relaxation" messages or scan retained policy history.
 
 The **remaining-ratio bands** have no hysteresis or cooldown. The exact current post-compaction ratio is authoritative. A compaction that moves the ratio from `critical` back to `ample` relaxes the pressure-band policy for that same model request.
 
-### Early consumption surge guidance
+### Early consumption surge notices (all modes)
 
-Adaptive mode also watches **changes** in remaining budget from one pre-step admission to the next, rather than only its current level. The default surge policy (independent of the 25% / 10% pressure bands) triggers when either:
+Every prompt mode, including `none`, watches **changes** in remaining budget from one pre-step admission to the next, rather than only its current level. The default surge policy (independent of the 25% / 10% pressure bands) triggers when either:
 
 - **Single step:** at least 3 percentage points of the proactive-compaction threshold are consumed, and the remaining ratio is at most 80%.
 - **Rolling five steps:** at least 6 percentage points are consumed over the last five step intervals, and the remaining ratio is at most 40%.
 
 For example, a decrease from 82.5% to 77.5% triggers the single-step alert while still far above the 25% conserve cutoff. Five consecutive small steps taking the remaining ratio from 37.5% to 30.0% trigger the rolling alert even if no individual step crosses 3 points.
 
-A surge briefly adds natural-language guidance to re-evaluate task scope, avoid low-value context growth, bound tool results, and reserve room for verification. It **does not** change tool permissions, context compaction, or the value/format of `context_remaining`. The warning is added to the existing adaptive Harness runtime context, not as another user message or numeric budget field. `critical` guidance takes precedence when the remaining ratio is already at or below 10%.
+On each new trigger, **all modes** receive a one-time source-attributed `user/message` event with a factual, non-prescriptive consumption notice. Example:
 
-Alerts remain active for three admitted steps and cannot re-trigger until five measured steps after the previous trigger. This avoids repeating the warning on each step while still supporting sustained high-consumption sessions. The trend history is an ephemeral per-agent `WeakMap`; a route/model switch, effective threshold change, budget increase after compaction or pruning, or unavailable budget state resets its baseline. Restarting the plugin also restarts the baseline. No second persistent trace or ledger is created.
+```text
+context_usage_notice: rapid consumption (5.0% of proactive-compaction budget over 1 step); remaining 77.5%.
+```
 
-Like the base budget snapshot, surge measurement happens after downstream pre-step compaction and before model-request admission. It can guide the **next request**, but cannot interrupt an already-running generation mid-step.
+The notice describes what happened, but does **not** tell the model what to do. `none`, `semantic`, `planning`, and `behavioral` do **not** receive any *surge-specific* behavior instructions, and work on older Harness runtimes without admission refresh.
+
+When `promptMode: adaptive` is selected, the same detection also briefly adds guidance to re-evaluate scope, avoid low-value exploration, bound tool results, and reserve room for verification. This guidance uses the existing admission-refreshed `systemPrompt.context()`; when the remaining ratio is at or below 10%, existing `critical` guidance takes precedence.
+
+The one-off notice and adaptive guidance **do not** change tool permissions, context compaction, or the value/format of `context_remaining`. `context_remaining` remains the only continuously updated numeric budget field. Factual notices use the distinct `source.form: 'surge-notice'`; retained-budget snapshot lookup ignores them so no duplicate snapshot is emitted merely because a notice follows it.
+
+The factual notice is emitted **only on a new trigger**, never each step. Adaptive-only guidance stays active for three admitted steps, and notices cannot re-trigger until five measured steps after the previous trigger. This avoids repeated model-facing warning events while still supporting sustained high-consumption sessions. The trend history is an ephemeral per-agent `WeakMap`; a route/model switch, effective threshold change, budget increase after compaction or pruning, or unavailable budget state resets its baseline. Restarting the plugin also restarts the baseline. No second persistent trace or ledger is created.
+
+Like the base budget snapshot, surge measurement happens after downstream pre-step compaction and before model-request admission. Its notice (and optional adaptive guidance) becomes visible to the **next model request**, but cannot interrupt an already-running generation mid-step.
 
 The experimental thresholds are hidden, non-volatile profile/runtime config:
 
 ```yaml
 config:
-  promptMode: adaptive
+  # Optional: notices work in every promptMode; adaptive adds guidance.
   surgePolicy:
     stepDropRatio: 0.03
     windowDropRatio: 0.06
@@ -253,13 +263,13 @@ config:
     activeSteps: 3
 ```
 
-All ratios must be in `(0, 1]`. Step counts must be positive integers and `activeSteps <= cooldownSteps`. Invalid config fails plugin activation. These controls are not exposed in the Web UI or injected as numerical guidance; controlled experiments can override them while preserving the underlying budget semantics.
+All ratios must be in `(0, 1]`. Step counts must be positive integers and `activeSteps <= cooldownSteps`. Invalid config fails plugin activation. These controls are not exposed in the Web UI or shown as explicit decision thresholds; the factual trigger notice reports observed consumption and remaining percentage, not the detector's cutoff configuration. Controlled experiments can override them while preserving the underlying budget semantics.
 
 ## Cache and context-growth behavior
 
 `context_remaining` remains an independent, very small source-attributed snapshot because its numeric value changes frequently. Moving that high-frequency value into Harness's complete runtime-context snapshot would cause unrelated runtime-context text to be repeated whenever the number changes.
 
-Adaptive guidance changes only with pressure bands or short-lived surge-alert transitions, so on refresh-capable Harness builds it is a good fit for `systemPrompt.context()`. Harness treats runtime context as cache-safe derived history and appends a changed current snapshot after retained history rather than rewriting the stable system-prompt prefix.
+Adaptive guidance changes only with pressure bands or short-lived surge-alert transitions, so on refresh-capable Harness builds it is a good fit for `systemPrompt.context()`. Factual surge notices are emitted as small independent source-attributed messages only when triggered and never rebuild the combined runtime context. Harness treats runtime context as cache-safe derived history and appends a changed current snapshot after retained history rather than rewriting the stable system-prompt prefix.
 
 ## Configure from the Web Plugins page
 
