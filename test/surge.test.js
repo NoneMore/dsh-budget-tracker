@@ -50,7 +50,7 @@ test('rolling detection needs a complete window of five step intervals', () => {
   const history = [300_000, 288_000, 276_000, 264_000, 252_000]
   assert.equal(detectBudgetSurge(history, 240_000, 800_000), true)
   assert.equal(detectBudgetSurge(history.slice(1), 240_000, 800_000), false)
-  assert.equal(detectBudgetSurge(history, 248_000, 800_000), false)
+  assert.equal(detectBudgetSurge([290_000, ...history.slice(1)], 248_000, 800_000), false)
 })
 
 test('surge state resets its history and cooldown after an upward pressure reset', () => {
