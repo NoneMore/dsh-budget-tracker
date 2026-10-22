@@ -14,7 +14,7 @@ A hidden representation control can instead show the same budget normalized agai
 context_remaining: 190000 / 800000 (23.8%)
 ```
 
-No search budget, browse budget, pressure label, or second model-visible budget field is added. Optional prompt modes can explain the field, guide planning, or opt into an internal relative-pressure policy. None of them changes the budget calculation or Harness compaction policy.
+No search budget, browse budget, pressure label, or second model-visible budget field is added. Optional prompt modes can explain the field, guide planning, or opt into an internal relative-pressure policy. The tracker also detects sudden or sustained budget consumption in every prompt mode; factual notices default off in `none` and on elsewhere, with behavioral guidance remaining adaptive-only. None of these changes the budget calculation or Harness compaction policy.
 
 ## Compatibility
 
@@ -153,15 +153,15 @@ Experiment observation is intentionally kept out of the runtime plugin. Comparat
 
 ## Prompt modes
 
-The dynamic budget snapshot and prompt guidance are deliberately separate. Configure `promptMode` on the plugin row:
+The dynamic budget snapshot, factual surge notices, and prompt guidance are deliberately separate. All modes detect consumption spikes, but factual notices default off for `none` and on for other modes; only `adaptive` adds surge-specific behavioral guidance. Configure `promptMode` on the plugin row:
 
 | Mode | Behavior |
 | --- | --- |
 | `semantic` | **Default.** Static system prompt explaining that `context_remaining` is the budget before proactive compaction, not the model's absolute context-window remainder. |
 | `planning` | Includes the semantic explanation and asks the model to use the value as a context-pressure signal when deciding how much context to spend on the current response. |
 | `behavioral` | Builds on `planning` and statically guides context-conserving behavior as the budget decreases: prioritize essentials, avoid unnecessary restatement, keep intermediate outputs compact, and prefer finishing current work over opening large new lines of work. It still defines no numeric thresholds. |
-| `adaptive` | Uses the same static baseline as `planning`, then contributes pressure-specific guidance through admission-refreshed Harness runtime context. Requires a runtime with `systemPrompt.refreshContext()`. |
-| `none` | Adds no static prompt guidance, matching the pre-prompt behavior of the plugin. |
+| `adaptive` | Uses the same static baseline as `planning`, then contributes pressure-specific and surge-specific behavioral guidance through admission-refreshed Harness runtime context. Requires a runtime with `systemPrompt.refreshContext()`. |
+| `none` | Adds no static prompt guidance. Still receives budget snapshots; factual surge notices are off by default but may be explicitly enabled. |
 
 The bundled patch defaults to:
 
@@ -214,20 +214,84 @@ budget-tracker:adaptive-guidance
 
 Harness evaluates that provider again during admission refresh after pre-step. The contribution is:
 
-- empty in `ample`;
-- the conserve guidance in `conserve`;
-- the critical guidance in `critical`;
+- empty in `ample` unless surge guidance is temporarily active;
+- the conserve guidance in `conserve`, optionally with surge guidance;
+- the critical guidance in `critical` (without redundant surge guidance);
 - empty when adaptive mode is disabled or the current budget cannot be resolved.
 
 The contribution is intentionally optional rather than `required`, so a scope that suppresses optional runtime context also suppresses adaptive guidance. Harness owns replacement of older runtime-context snapshots, so the plugin does not emit neutral "relaxation" messages or scan retained policy history.
 
-There is no hysteresis or cooldown. The exact current post-compaction ratio is authoritative. A compaction that moves the ratio from `critical` back to `ample` relaxes policy for that same model request.
+The **remaining-ratio bands** have no hysteresis or cooldown. The exact current post-compaction ratio is authoritative. A compaction that moves the ratio from `critical` back to `ample` relaxes the pressure-band policy for that same model request.
+
+### Early consumption surge detection and notices
+
+Every prompt mode, including `none`, **detects** changes in remaining budget from one pre-step admission to the next. Factual **notice delivery** is independent of detection and adaptive guidance. The default policy (independent of the 25% / 10% pressure bands) considers either:
+
+- **Single step:** at least 3 percentage points of the proactive-compaction threshold are consumed, and the remaining ratio is at most 80%.
+- **Rolling five steps:** at least 6 percentage points are consumed over the last five step intervals, and the remaining ratio is at most 40%.
+
+For example, a decrease from 82.5% to 77.5% qualifies as a single-step surge while still above the 25% conserve cutoff. Five small steps taking the remaining ratio from 37.5% to 30.0% qualify for the rolling condition, even if none individually crosses 3 points.
+
+Factual notice delivery uses a hidden, non-volatile three-state configuration:
+
+```yaml
+config:
+  surgeNotice: auto # auto | on | off
+```
+
+- `auto` (default): notices are **off for `none`** and **on for `semantic`, `planning`, `behavioral`, and `adaptive`**.
+- `on`: explicitly enable factual notices, including in `none`.
+- `off`: disable factual notices for any prompt mode.
+
+The detector always runs when the budget is available, including when notice delivery is disabled. Neither `on` nor `off` changes adaptive-only guidance. Older Harness runtimes without admission refresh can still emit notices in non-adaptive modes.
+
+A notice is a short, source-attributed `user/message` **historical observation**, not an instruction or a permanently active warning. Its representation follows `budgetRepresentation`, independently of `promptMode`, so raw sessions do not leak normalized percentages.
+
+With `budgetRepresentation: raw` (the default):
+
+```text
+context_usage_notice: observed rapid consumption (40000 tokens over 1 step); remaining 620000 tokens at observation.
+```
+
+With `budgetRepresentation: normalized`:
+
+```text
+context_usage_notice: observed rapid consumption (5.0% of proactive-compaction budget over 1 step); remaining 77.5% at observation.
+```
+
+A factual event reports observed history and contains no request, imperative, or strategy instruction. `none`, `semantic`, `planning`, and `behavioral` never receive surge-specific behavioral guidance.
+
+When `promptMode: adaptive` is selected, the same detector can briefly add guidance to reassess scope, avoid low-value exploration, bound tool results, and reserve room for verification. This guidance uses admission-refreshed `systemPrompt.context()`; existing `critical` guidance takes precedence at or below 10% remaining, and notice delivery can be off while this guidance stays active.
+
+**Edge-triggered semantics:** the detector emits only on a transition from normal to surging. As long as either single-step or rolling-window surge remains true, it does not re-emit, even after the cooldown expires. It re-arms only after **both** conditions are false. A fresh normal-to-surging transition must also satisfy the 5-measured-step cooldown since the previous emitted event. If a new transition occurs during cooldown, it is suppressed and never replayed merely because cooldown later expires. Adaptive-only guidance remains active for 3 admitted steps from an accepted event.
+
+Per-agent rolling history and edge state live in an ephemeral `WeakMap`. A route/model switch, effective threshold change, budget increase after compaction or pruning, or unavailable budget state resets the baseline. Restarting the plugin also restarts the baseline. Events already emitted remain immutable historical facts; they are not withdrawn when the detector re-arms or budget recovers. No second persistent trace or ledger is created.
+
+The factual notice and adaptive guidance do **not** change tool permissions, context compaction, or the value/format of `context_remaining`. `context_remaining` remains the only continuously updated numeric budget field. Notices use `source.form: 'surge-notice'`; retained-budget snapshot lookup ignores them so no duplicate snapshot is emitted merely because a notice follows it.
+
+Like the base budget snapshot, surge measurement happens after downstream pre-step compaction and before model-request admission. The notice (and optional adaptive guidance) is visible to the **next model request**, but cannot interrupt a generation already in progress.
+
+The experimental detector thresholds remain hidden, non-volatile profile/runtime configuration:
+
+```yaml
+config:
+  surgePolicy:
+    stepDropRatio: 0.03
+    windowDropRatio: 0.06
+    stepMaxRemainingRatio: 0.80
+    windowMaxRemainingRatio: 0.40
+    windowSteps: 5
+    cooldownSteps: 5
+    activeSteps: 3
+```
+
+All ratios must be in `(0, 1]`; step counts must be positive integers and `activeSteps <= cooldownSteps`. Invalid configuration fails plugin activation. The controls are not shown in the Web UI or reported as model-visible decision cutoffs. Controlled experiments can override them while preserving the budget semantics. Canonical experiment provenance should record the effective `surgeNotice`, `surgePolicy`, representation, mode, and implementation revision (see #12).
 
 ## Cache and context-growth behavior
 
 `context_remaining` remains an independent, very small source-attributed snapshot because its numeric value changes frequently. Moving that high-frequency value into Harness's complete runtime-context snapshot would cause unrelated runtime-context text to be repeated whenever the number changes.
 
-Adaptive policy is different: it changes only when the resolved band changes, so on refresh-capable Harness builds it is a good fit for `systemPrompt.context()`. Harness treats runtime context as cache-safe derived history and appends a changed current snapshot after retained history rather than rewriting the stable system-prompt prefix.
+Adaptive guidance changes only with pressure bands or short-lived surge-alert transitions, so on refresh-capable Harness builds it is a good fit for `systemPrompt.context()`. Factual surge notices are emitted as small independent source-attributed messages only when triggered and never rebuild the combined runtime context. Harness treats runtime context as cache-safe derived history and appends a changed current snapshot after retained history rather than rewriting the stable system-prompt prefix.
 
 ## Configure from the Web Plugins page
 
@@ -235,7 +299,7 @@ On DeepSeek Harness Web, the bundle ships a browser-side configuration page for 
 
 The page presents all five prompt modes as selectable options and writes `promptMode` through Harness Settings/config-editor. Changes therefore persist in the active profile configuration instead of being stored separately by this plugin. **Reset to inherited** removes the profile override and restores the value supplied by the lower configuration layer; with the bundled patch, that inherited value is `semantic`.
 
-Only `promptMode` is exposed as a volatile Web-editable field. Budget representation and adaptive thresholds are hidden non-volatile controls; the budget calculation itself remains read-only and continues to derive from the active compaction policy. Selecting Adaptive requires a Harness runtime with admission-time `systemPrompt.refreshContext()`.
+Only `promptMode` is exposed as a volatile Web-editable field. Budget representation, surge notice delivery, and adaptive/surge thresholds are hidden non-volatile controls; the budget calculation itself remains read-only and continues to derive from the active compaction policy. Selecting Adaptive requires a Harness runtime with admission-time `systemPrompt.refreshContext()`.
 
 ## Dynamic context
 

@@ -12,6 +12,8 @@ export const ADAPTIVE_POLICY_CONTEXT_ORDER = 9800
 export const BUDGET_REPRESENTATIONS = Object.freeze(['raw', 'normalized'])
 export const DEFAULT_BUDGET_REPRESENTATION = 'raw'
 export const BUDGET_PERCENT_PRECISION = 1
+export const SURGE_NOTICE_MODES = Object.freeze(['auto', 'on', 'off'])
+export const DEFAULT_SURGE_NOTICE = 'auto'
 
 // Experimental defaults. They remain model-invisible and are not exposed by
 // the Web configuration surface, but can be overridden in runtime/profile
@@ -23,6 +25,18 @@ export const ADAPTIVE_BAND_RATIOS = Object.freeze({
 export const DEFAULT_ADAPTIVE_POLICY = Object.freeze({
   conserveRatio: ADAPTIVE_BAND_RATIOS.conserve,
   criticalRatio: ADAPTIVE_BAND_RATIOS.critical,
+})
+
+// Relative to the same proactive-compaction threshold as context_remaining.
+// All cutoffs are experimental, hidden config (not model-visible thresholds).
+export const DEFAULT_SURGE_POLICY = Object.freeze({
+  stepDropRatio: 0.03,
+  windowDropRatio: 0.06,
+  stepMaxRemainingRatio: 0.80,
+  windowMaxRemainingRatio: 0.40,
+  windowSteps: 5,
+  cooldownSteps: 5,
+  activeSteps: 3,
 })
 
 /**
@@ -37,6 +51,16 @@ export const Config = z.object({
   adaptivePolicy: z.object({
     conserveRatio: z.number().min(0).max(1).default(DEFAULT_ADAPTIVE_POLICY.conserveRatio),
     criticalRatio: z.number().min(0).max(1).default(DEFAULT_ADAPTIVE_POLICY.criticalRatio),
+  }).default({}),
+  surgeNotice: z.union([...SURGE_NOTICE_MODES]).default(DEFAULT_SURGE_NOTICE),
+  surgePolicy: z.object({
+    stepDropRatio: z.number().min(0).max(1).default(DEFAULT_SURGE_POLICY.stepDropRatio),
+    windowDropRatio: z.number().min(0).max(1).default(DEFAULT_SURGE_POLICY.windowDropRatio),
+    stepMaxRemainingRatio: z.number().min(0).max(1).default(DEFAULT_SURGE_POLICY.stepMaxRemainingRatio),
+    windowMaxRemainingRatio: z.number().min(0).max(1).default(DEFAULT_SURGE_POLICY.windowMaxRemainingRatio),
+    windowSteps: z.number().min(1).default(DEFAULT_SURGE_POLICY.windowSteps),
+    cooldownSteps: z.number().min(1).default(DEFAULT_SURGE_POLICY.cooldownSteps),
+    activeSteps: z.number().min(1).default(DEFAULT_SURGE_POLICY.activeSteps),
   }).default({}),
 })
 
@@ -57,6 +81,8 @@ const ADAPTIVE_POLICY_TEXT = Object.freeze({
   conserve: 'Adaptive context-conservation guidance: reduce avoidable context growth. Avoid redundant restatement and low-value exploration, keep intermediate outputs and tool-result handling compact, and prefer advancing the current task. Necessary verification and exploration for correctness remain appropriate.',
   critical: 'Adaptive context-conservation guidance: context pressure is severe. Do only the work needed to finish the current task or reach a safe checkpoint. Avoid large new workstreams and nonessential exploration; prioritize finish, verify, and report.',
 })
+
+export const SURGE_GUIDANCE_TEXT = 'Recent context consumption has accelerated. Reassess remaining work against available budget. Prefer focused investigation, bounded tool outputs, and reserving context for necessary verification and completion.'
 
 /**
  * Resolve the optional static system-prompt guidance for one configured mode.
@@ -124,6 +150,35 @@ export function resolveAdaptivePolicyConfig(config = {}) {
   }
 
   return Object.freeze({ conserveRatio, criticalRatio })
+}
+
+/** Resolve hidden factual-notice delivery independently of the detector. */
+export function resolveSurgeNoticeConfig(config = {}) {
+  const mode = config?.surgeNotice ?? DEFAULT_SURGE_NOTICE
+  if (!SURGE_NOTICE_MODES.includes(mode)) {
+    throw new TypeError('dsh-budget-tracker: surgeNotice must be one of auto, on, off')
+  }
+  return mode
+}
+
+/** Validate hidden surge-detection tuning at plugin activation. */
+export function resolveSurgePolicyConfig(config = {}) {
+  const policy = { ...DEFAULT_SURGE_POLICY, ...(config?.surgePolicy ?? {}) }
+  const fractions = [
+    policy.stepDropRatio,
+    policy.windowDropRatio,
+    policy.stepMaxRemainingRatio,
+    policy.windowMaxRemainingRatio,
+  ]
+  const counts = [policy.windowSteps, policy.cooldownSteps, policy.activeSteps]
+  if (!fractions.every(value => Number.isFinite(value) && value > 0 && value <= 1)
+    || !counts.every(value => Number.isSafeInteger(value) && value > 0)
+    || policy.activeSteps > policy.cooldownSteps) {
+    throw new TypeError(
+      'dsh-budget-tracker: surgePolicy requires ratios in (0, 1], positive integer steps, and activeSteps <= cooldownSteps',
+    )
+  }
+  return Object.freeze(policy)
 }
 
 function adaptiveRuntimeUnavailable() {
@@ -324,6 +379,96 @@ export function resolveAdaptiveBand(
   return 'ample'
 }
 
+/**
+ * Detect a step-size jump or an accelerating five-step burn rate. Only
+ * compare snapshots with a stable routed model and pressure threshold.
+ * History contains earlier *pre-step* remaining values, oldest first.
+ */
+export function detectBudgetSurge(history, currentRemaining, thresholdTokens, policy = DEFAULT_SURGE_POLICY) {
+  if (history.length === 0 || thresholdTokens <= 0) return false
+  const remainingRatio = currentRemaining / thresholdTokens
+  const stepDropRatio = (history[history.length - 1] - currentRemaining) / thresholdTokens
+  if (stepDropRatio >= policy.stepDropRatio
+    && remainingRatio <= policy.stepMaxRemainingRatio) return true
+
+  if (history.length < policy.windowSteps) return false
+  const windowDropRatio =
+    (history[history.length - policy.windowSteps] - currentRemaining) / thresholdTokens
+  return windowDropRatio >= policy.windowDropRatio
+    && remainingRatio <= policy.windowMaxRemainingRatio
+}
+
+/**
+ * Per-agent, ephemeral surge state. A compaction/pruning increase, route change,
+ * or effective threshold change starts a fresh baseline instead of comparing
+ * incomparable snapshots. A new alert is emitted only on a trigger; adaptive
+ * guidance may remain active briefly; edge triggering and cooldown prevent repeated pulses.
+ */
+export function advanceSurgeState(previous, budget, policy = DEFAULT_SURGE_POLICY) {
+  const lastRemaining = previous?.history.at(-1)
+  const comparable = previous?.provider === budget.provider
+    && previous?.model === budget.model
+    && previous?.thresholdTokens === budget.thresholdTokens
+    && budget.remaining <= lastRemaining
+
+  const state = comparable ? previous : {
+    provider: budget.provider,
+    model: budget.model,
+    thresholdTokens: budget.thresholdTokens,
+    history: [],
+    step: 0,
+    isSurging: false,
+    lastAlertStep: -Infinity,
+    activeUntilStep: -Infinity,
+  }
+  state.step += 1
+
+  // Only normal -> surging emits. A cooldown-suppressed edge does not
+  // turn into a delayed alert while the same surge remains active.
+  const isSurging = detectBudgetSurge(state.history, budget.remaining, budget.thresholdTokens, policy)
+  const enteredSurge = isSurging && !state.isSurging
+  state.isSurging = isSurging
+
+  let alert
+  if (enteredSurge && state.step - state.lastAlertStep >= policy.cooldownSteps) {
+    state.lastAlertStep = state.step
+    state.activeUntilStep = state.step + policy.activeSteps - 1
+
+    const previousRemaining = state.history.at(-1)
+    const singleDrop = (previousRemaining - budget.remaining) / budget.thresholdTokens
+    const isSingle = singleDrop >= policy.stepDropRatio
+      && budget.remaining / budget.thresholdTokens <= policy.stepMaxRemainingRatio
+    const spanSteps = isSingle ? 1 : policy.windowSteps
+    const baseline = state.history[state.history.length - spanSteps]
+    alert = {
+      spanSteps,
+      spentTokens: baseline - budget.remaining,
+      remainingTokens: budget.remaining,
+      spentRatio: (baseline - budget.remaining) / budget.thresholdTokens,
+      remainingRatio: budget.remaining / budget.thresholdTokens,
+    }
+  }
+
+  state.history.push(budget.remaining)
+  if (state.history.length > policy.windowSteps) state.history.shift()
+  return { state, active: state.step <= state.activeUntilStep, alert }
+}
+
+/** Historical, factual event: the representation matches context_remaining. */
+export function formatSurgeNotice(
+  { spanSteps, spentTokens, remainingTokens, spentRatio, remainingRatio },
+  representation = DEFAULT_BUDGET_REPRESENTATION,
+) {
+  const steps = spanSteps === 1 ? 'step' : 'steps'
+  if (representation === 'raw') {
+    return `context_usage_notice: observed rapid consumption (${spentTokens} tokens over ${spanSteps} ${steps}); remaining ${remainingTokens} tokens at observation.`
+  }
+  if (representation === 'normalized') {
+    return `context_usage_notice: observed rapid consumption (${(spentRatio * 100).toFixed(1)}% of proactive-compaction budget over ${spanSteps} ${steps}); remaining ${(remainingRatio * 100).toFixed(1)}% at observation.`
+  }
+  throw new TypeError('dsh-budget-tracker: unsupported surge notice representation')
+}
+
 /** Build one immutable budget snapshot message without runtime dependencies. */
 function createBudgetMessage(text) {
   const section = Object.freeze({ name: 'budget-tracker:context-remaining', text })
@@ -340,13 +485,30 @@ function createBudgetMessage(text) {
   })
 }
 
-/** Return the newest retained budget snapshot text, if one survives. */
+/** Emit a source-attributed one-off notice without coupling it to promptMode. */
+function createSurgeNotice(text) {
+  const section = Object.freeze({ name: 'budget-tracker:consumption-notice', text })
+  const source = Object.freeze({
+    kind: name,
+    form: 'surge-notice',
+    sections: Object.freeze([section]),
+  })
+  return Object.freeze({
+    id: randomUUID(),
+    role: 'user',
+    content: Object.freeze([Object.freeze({ type: 'text', text })]),
+    source,
+  })
+}
+
+/** Return the newest retained budget snapshot text, ignoring surge notices. */
 function retainedBudgetText(session) {
   const nodes = session?.surface?.nodes
   if (!nodes || typeof session.eventAt !== 'function') return undefined
   for (let index = nodes.length - 1; index >= 0; index -= 1) {
     const event = session.eventAt(nodes[index])
-    if (event?.type !== 'user/message' || event.data?.source?.kind !== name) continue
+    if (event?.type !== 'user/message' || event.data?.source?.kind !== name
+      || event.data?.source?.form === 'surge-notice') continue
     const [block] = event.data.content ?? []
     return event.data.content?.length === 1 && block?.type === 'text'
       ? block.text
@@ -421,6 +583,8 @@ async function resolveBudgetState(ctx, agent, signal) {
   if (remaining === undefined) return undefined
 
   return {
+    provider,
+    model,
     thresholdTokens,
     remaining,
   }
@@ -436,7 +600,10 @@ async function resolveBudgetState(ctx, agent, signal) {
 export function apply(ctx, config = {}) {
   const budgetRepresentation = resolveBudgetRepresentation(config)
   const adaptivePolicy = resolveAdaptivePolicyConfig(config)
+  const surgePolicy = resolveSurgePolicyConfig(config)
+  const surgeNotice = resolveSurgeNoticeConfig(config)
   const adaptiveGuidanceByAgent = new WeakMap()
+  const surgeStateByAgent = new WeakMap()
   const runtimeCapabilities = { admissionContextRefresh: undefined }
   registerPrompt(ctx, config, adaptiveGuidanceByAgent, runtimeCapabilities)
   registerSettingsPresentation(ctx)
@@ -466,15 +633,35 @@ export function apply(ctx, config = {}) {
       ? resolveAdaptiveBand(budget.remaining, budget.thresholdTokens, adaptivePolicy)
       : undefined
 
-    adaptiveGuidanceByAgent.set(agent, resolveAdaptivePolicyText(band) ?? '')
-
-    if (budgetText === undefined || retainedBudgetText(agent.session) === budgetText) {
-      return decision
+    // Detection and factual notification apply to every mode, including none.
+    // Only adaptive turns this same signal into behavioral guidance.
+    let surge
+    if (budget !== undefined) {
+      surge = advanceSurgeState(surgeStateByAgent.get(agent), budget, surgePolicy)
+      surgeStateByAgent.set(agent, surge.state)
+    } else {
+      surgeStateByAgent.delete(agent)
     }
 
-    return {
-      ...decision,
-      messages: [...decision.messages, createBudgetMessage(budgetText)],
+    // Critical adaptive guidance already prioritizes finishing. Non-adaptive
+    // modes never receive behavioral guidance, only a factual notice event.
+    const guidance = promptMode === 'adaptive'
+      ? [
+          resolveAdaptivePolicyText(band) ?? '',
+          surge?.active && band !== 'critical' ? SURGE_GUIDANCE_TEXT : '',
+        ].filter(Boolean).join('\n')
+      : ''
+    adaptiveGuidanceByAgent.set(agent, guidance)
+
+    const messages = [...decision.messages]
+    if (budgetText !== undefined && retainedBudgetText(agent.session) !== budgetText) {
+      messages.push(createBudgetMessage(budgetText))
     }
+    if (surge?.alert && (surgeNotice === 'on'
+      || (surgeNotice === 'auto' && promptMode !== 'none'))) {
+      messages.push(createSurgeNotice(formatSurgeNotice(surge.alert, budgetRepresentation)))
+    }
+    if (messages.length === decision.messages.length) return decision
+    return { ...decision, messages }
   }, { prepend: true })
 }
