@@ -172,6 +172,8 @@ function integrationHarness({
   hasLlm = true,
   hasTokenMeter = true,
   promptMode,
+  surgeNotice,
+  budgetRepresentation,
 } = {}) {
   let currentTokens = beforeTokens
   let downstreamTokens = afterTokens
@@ -300,7 +302,11 @@ function integrationHarness({
     },
   })
 
-  apply(ctx, promptMode === undefined ? undefined : { promptMode })
+  apply(ctx, {
+    ...(promptMode === undefined ? {} : { promptMode }),
+    ...(surgeNotice === undefined ? {} : { surgeNotice }),
+    ...(budgetRepresentation === undefined ? {} : { budgetRepresentation }),
+  })
   return {
     options,
     serviceLookups,
@@ -518,7 +524,7 @@ test('adaptive surge sends a factual notice AND runtime guidance above conserve'
   assert.equal(decision.messages[1].source.form, 'surge-notice')
   assert.equal(
     decision.messages[1].content[0].text,
-    'context_usage_notice: rapid consumption (5.0% of proactive-compaction budget over 1 step); remaining 77.5%.',
+    'context_usage_notice: observed rapid consumption (40000 tokens over 1 step); remaining 620000 tokens at observation.',
   )
   assert.equal(harness.policyText(), SURGE_GUIDANCE_TEXT)
 })
@@ -536,14 +542,14 @@ test('adaptive surge detects sustained burn across five small steps', async () =
   assert.equal(harness.policyText(), SURGE_GUIDANCE_TEXT)
 })
 
-test('surge warning persists for three steps and respects its five-step cooldown', async () => {
+test('surge guidance lasts three steps; suppressed edges do not fire after cooldown without recovery', async () => {
   const harness = integrationHarness({ promptMode: 'adaptive', afterTokens: 160_000 })
   await harness.run()
   harness.setAfterTokens(190_000)
   await harness.run() // step 2: trigger
   assert.equal(harness.policyText(), SURGE_GUIDANCE_TEXT)
 
-  await harness.run() // step 3: still active
+  await harness.run() // step 3: guidance remains active, detector re-arms
   assert.equal(harness.policyText(), SURGE_GUIDANCE_TEXT)
   await harness.run() // step 4: still active
   assert.equal(harness.policyText(), SURGE_GUIDANCE_TEXT)
@@ -551,10 +557,19 @@ test('surge warning persists for three steps and respects its five-step cooldown
   assert.equal(harness.policyText(), '')
 
   harness.setAfterTokens(230_000)
-  await harness.run() // step 6: drop is large, but cooldown applies
+  const suppressed = await harness.run() // step 6: a new edge inside cooldown
+  assert.equal(suppressed.messages.some(m => m.source?.form === 'surge-notice'), false)
   assert.equal(harness.policyText(), '')
+
   harness.setAfterTokens(261_000)
-  await harness.run() // step 7: cooldown has passed
+  const continuous = await harness.run() // step 7: cooldown passed, but same surge persists
+  assert.equal(continuous.messages.some(m => m.source?.form === 'surge-notice'), false)
+  assert.equal(harness.policyText(), '')
+
+  await harness.run() // step 8: detector recovers with no further consumption
+  harness.setAfterTokens(292_000)
+  const fresh = await harness.run() // step 9: new edge
+  assert.equal(fresh.messages.filter(m => m.source?.form === 'surge-notice').length, 1)
   assert.equal(harness.policyText(), SURGE_GUIDANCE_TEXT)
 })
 
@@ -605,8 +620,8 @@ test('surge baseline resets when the effective compaction threshold changes', as
   assert.equal(harness.policyText(), SURGE_GUIDANCE_TEXT)
 })
 
-test('all non-adaptive modes emit one factual alert with no guidance', async () => {
-  for (const mode of ['none', 'semantic', 'planning', 'behavioral']) {
+test('non-adaptive default modes emit one factual alert without behavioral guidance', async () => {
+  for (const mode of ['semantic', 'planning', 'behavioral']) {
     const harness = integrationHarness({
       promptMode: mode,
       afterTokens: 140_000,
@@ -623,16 +638,64 @@ test('all non-adaptive modes emit one factual alert with no guidance', async () 
     assert.equal(decision.messages[1].source.form, 'surge-notice', mode)
     assert.equal(
       decision.messages[1].content[0].text,
-      'context_usage_notice: rapid consumption (5.0% of proactive-compaction budget over 1 step); remaining 77.5%.',
+      'context_usage_notice: observed rapid consumption (40000 tokens over 1 step); remaining 620000 tokens at observation.',
       mode,
     )
-
-    // Cooldown: even another large drop must not re-emit on the next step.
     harness.setAfterTokens(230_000)
     const next = await harness.run()
     assert.equal(next.messages.some(m => m.source?.form === 'surge-notice'), false, mode)
     assert.equal(harness.policyText(), '', mode)
   }
+})
+
+test('none defaults notices off; explicit on overrides; explicit off suppresses non-adaptive notices', async () => {
+  for (const [mode, surgeNotice, expectsNotice] of [
+    ['none', undefined, false],
+    ['none', 'auto', false],
+    ['none', 'on', true],
+    ['semantic', 'off', false],
+  ]) {
+    const harness = integrationHarness({
+      promptMode: mode,
+      surgeNotice,
+      afterTokens: 140_000,
+      supportsAdmissionContextRefresh: false,
+    })
+    await harness.run()
+    harness.setAfterTokens(180_000)
+    const decision = await harness.run()
+    assert.equal(
+      decision.messages.some(m => m.source?.form === 'surge-notice'),
+      expectsNotice, `${mode}/${surgeNotice}`,
+    )
+    assert.equal(harness.policyText(), '')
+    assert.equal(decision.messages[0].content[0].text, 'context_remaining: 620000')
+  }
+})
+
+test('disabling factual notices does not suppress adaptive surge guidance', async () => {
+  const harness = integrationHarness({ promptMode: 'adaptive', surgeNotice: 'off', afterTokens: 140_000 })
+  await harness.run()
+  harness.setAfterTokens(180_000)
+  const decision = await harness.run()
+  assert.equal(decision.messages.some(m => m.source?.form === 'surge-notice'), false)
+  assert.equal(harness.policyText(), SURGE_GUIDANCE_TEXT)
+})
+
+test('normalized notice preserves relative-pressure treatment', async () => {
+  const harness = integrationHarness({
+    promptMode: 'semantic',
+    budgetRepresentation: 'normalized',
+    afterTokens: 140_000,
+  })
+  await harness.run()
+  harness.setAfterTokens(180_000)
+  const decision = await harness.run()
+  assert.equal(decision.messages[0].content[0].text, 'context_remaining: 620000 / 800000 (77.5%)')
+  assert.equal(
+    decision.messages[1].content[0].text,
+    'context_usage_notice: observed rapid consumption (5.0% of proactive-compaction budget over 1 step); remaining 77.5% at observation.',
+  )
 })
 
 test('surge notice is not mistaken for the latest retained budget snapshot', async () => {
@@ -645,7 +708,7 @@ test('surge notice is not mistaken for the latest retained budget snapshot', asy
   assert.deepEqual(await harness.run(), { kind: 'enter', messages: [] })
 })
 
-test('all modes can detect rolling burn without an individual step spike', async () => {
+test('non-adaptive modes detect rolling burn without an individual step spike', async () => {
   const harness = integrationHarness({ promptMode: 'semantic', afterTokens: 500_000 })
   await harness.run()
   for (let index = 1; index < 5; index += 1) {
@@ -658,7 +721,7 @@ test('all modes can detect rolling burn without an individual step spike', async
   assert.equal(decision.messages.filter(m => m.source?.form === 'surge-notice').length, 1)
   assert.equal(
     decision.messages.find(m => m.source?.form === 'surge-notice').content[0].text,
-    'context_usage_notice: rapid consumption (7.5% of proactive-compaction budget over 5 steps); remaining 30.0%.',
+    'context_usage_notice: observed rapid consumption (60000 tokens over 5 steps); remaining 240000 tokens at observation.',
   )
   assert.equal(harness.policyText(), '')
 })
@@ -672,10 +735,22 @@ test('critical pressure remains the dominant guidance even during a surge', asyn
   assert.equal(decision.messages.filter(m => m.source?.form === 'surge-notice').length, 1)
 })
 
-test('surge notice formatting is factual and contains no prescriptive text', () => {
-  const single = formatSurgeNotice({ spanSteps: 1, spentRatio: 0.05, remainingRatio: 0.775 })
-  const rolling = formatSurgeNotice({ spanSteps: 5, spentRatio: 0.075, remainingRatio: 0.30 })
-  assert.match(single, /5\.0%.*1 step/)
+test('surge notice formatting matches representation and contains no prescriptive text', () => {
+  const observed = {
+    spanSteps: 1, spentTokens: 40_000, remainingTokens: 620_000,
+    spentRatio: 0.05, remainingRatio: 0.775,
+  }
+  const raw = formatSurgeNotice(observed, 'raw')
+  const normalized = formatSurgeNotice(observed, 'normalized')
+  const rolling = formatSurgeNotice({
+    spanSteps: 5, spentTokens: 60_000, remainingTokens: 240_000,
+    spentRatio: 0.075, remainingRatio: 0.30,
+  }, 'normalized')
+  assert.match(raw, /40000 tokens.*1 step.*620000 tokens/)
+  assert.doesNotMatch(raw, /%|proactive-compaction budget/)
+  assert.match(normalized, /5\.0%.*1 step.*77\.5%/)
   assert.match(rolling, /7\.5%.*5 steps/)
-  assert.doesNotMatch(single, /reassess|should|must|prioritize|prefer|reduce/i)
+  assert.match(raw, /observed/)
+  assert.doesNotMatch(raw, /reassess|should|must|prioritize|prefer|reduce/i)
+  assert.throws(() => formatSurgeNotice(observed, 'invalid'), /representation/)
 })

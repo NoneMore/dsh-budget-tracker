@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 import {
   Config,
   DEFAULT_SURGE_POLICY,
+  DEFAULT_SURGE_NOTICE,
+  resolveSurgeNoticeConfig,
   resolveSurgePolicyConfig,
   detectBudgetSurge,
   advanceSurgeState,
@@ -19,6 +21,15 @@ test('surge defaults are hidden non-volatile experiment controls', () => {
   assert.equal(custom.stepDropRatio, 0.05)
   assert.equal(custom.windowSteps, 4)
   assert.equal(custom.windowDropRatio, DEFAULT_SURGE_POLICY.windowDropRatio)
+})
+
+test('notice delivery defaults to auto and accepts explicit on/off overrides', () => {
+  assert.equal(DEFAULT_SURGE_NOTICE, 'auto')
+  assert.equal(Config({}).surgeNotice, 'auto')
+  for (const mode of ['auto', 'on', 'off']) {
+    assert.equal(resolveSurgeNoticeConfig({ surgeNotice: mode }), mode)
+  }
+  assert.throws(() => resolveSurgeNoticeConfig({ surgeNotice: 'always' }), /surgeNotice must be/)
 })
 
 test('rejects invalid surge ratios, fractional steps, and overlong active windows', () => {
@@ -63,4 +74,35 @@ test('surge state resets its history and cooldown after an upward pressure reset
   assert.equal(b3.active, false)
   assert.deepEqual(b3.state.history, [600_000])
   assert.equal(b3.state.step, 1)
+})
+
+test('continuous surge emits only on the entering edge, not after cooldown', () => {
+  const initial = { provider: 'deepseek', model: 'model', thresholdTokens: 800_000, remaining: 640_000 }
+  let state = advanceSurgeState(undefined, initial).state
+  const alertSteps = []
+  for (let step = 1; step <= 9; step += 1) {
+    const next = advanceSurgeState(state, { ...initial, remaining: 640_000 - step * 32_000 })
+    state = next.state
+    if (next.alert) alertSteps.push(step)
+  }
+  assert.deepEqual(alertSteps, [1])
+  assert.equal(state.isSurging, true)
+})
+
+test('a cooldown-suppressed edge is not delayed, but recovery re-arms detection', () => {
+  const initial = { provider: 'deepseek', model: 'model', thresholdTokens: 800_000, remaining: 640_000 }
+  let state = advanceSurgeState(undefined, initial).state
+  const advance = remaining => {
+    const next = advanceSurgeState(state, { ...initial, remaining })
+    state = next.state
+    return next.alert
+  }
+  assert.ok(advance(608_000)) // step 2: first edge
+  assert.equal(advance(608_000), undefined) // step 3: re-arm
+  assert.equal(advance(576_000), undefined) // step 4: suppressed by cooldown
+  assert.equal(advance(544_000), undefined) // step 5: same surge
+  assert.equal(advance(512_000), undefined) // step 6: same surge
+  assert.equal(advance(480_000), undefined) // step 7: cooldown ended, still same surge
+  assert.equal(advance(480_000), undefined) // step 8: re-arm
+  assert.ok(advance(448_000)) // step 9: new edge after cooldown
 })

@@ -12,6 +12,8 @@ export const ADAPTIVE_POLICY_CONTEXT_ORDER = 9800
 export const BUDGET_REPRESENTATIONS = Object.freeze(['raw', 'normalized'])
 export const DEFAULT_BUDGET_REPRESENTATION = 'raw'
 export const BUDGET_PERCENT_PRECISION = 1
+export const SURGE_NOTICE_MODES = Object.freeze(['auto', 'on', 'off'])
+export const DEFAULT_SURGE_NOTICE = 'auto'
 
 // Experimental defaults. They remain model-invisible and are not exposed by
 // the Web configuration surface, but can be overridden in runtime/profile
@@ -50,6 +52,7 @@ export const Config = z.object({
     conserveRatio: z.number().min(0).max(1).default(DEFAULT_ADAPTIVE_POLICY.conserveRatio),
     criticalRatio: z.number().min(0).max(1).default(DEFAULT_ADAPTIVE_POLICY.criticalRatio),
   }).default({}),
+  surgeNotice: z.union([...SURGE_NOTICE_MODES]).default(DEFAULT_SURGE_NOTICE),
   surgePolicy: z.object({
     stepDropRatio: z.number().min(0).max(1).default(DEFAULT_SURGE_POLICY.stepDropRatio),
     windowDropRatio: z.number().min(0).max(1).default(DEFAULT_SURGE_POLICY.windowDropRatio),
@@ -147,6 +150,15 @@ export function resolveAdaptivePolicyConfig(config = {}) {
   }
 
   return Object.freeze({ conserveRatio, criticalRatio })
+}
+
+/** Resolve hidden factual-notice delivery independently of the detector. */
+export function resolveSurgeNoticeConfig(config = {}) {
+  const mode = config?.surgeNotice ?? DEFAULT_SURGE_NOTICE
+  if (!SURGE_NOTICE_MODES.includes(mode)) {
+    throw new TypeError('dsh-budget-tracker: surgeNotice must be one of auto, on, off')
+  }
+  return mode
 }
 
 /** Validate hidden surge-detection tuning at plugin activation. */
@@ -390,7 +402,7 @@ export function detectBudgetSurge(history, currentRemaining, thresholdTokens, po
  * Per-agent, ephemeral surge state. A compaction/pruning increase, route change,
  * or effective threshold change starts a fresh baseline instead of comparing
  * incomparable snapshots. A new alert is emitted only on a trigger; adaptive
- * guidance may remain active briefly, with cooldown preventing repeated pulses.
+ * guidance may remain active briefly; edge triggering and cooldown prevent repeated pulses.
  */
 export function advanceSurgeState(previous, budget, policy = DEFAULT_SURGE_POLICY) {
   const lastRemaining = previous?.history.at(-1)
@@ -405,14 +417,20 @@ export function advanceSurgeState(previous, budget, policy = DEFAULT_SURGE_POLIC
     thresholdTokens: budget.thresholdTokens,
     history: [],
     step: 0,
+    isSurging: false,
     lastAlertStep: -Infinity,
     activeUntilStep: -Infinity,
   }
   state.step += 1
 
+  // Only normal -> surging emits. A cooldown-suppressed edge does not
+  // turn into a delayed alert while the same surge remains active.
+  const isSurging = detectBudgetSurge(state.history, budget.remaining, budget.thresholdTokens, policy)
+  const enteredSurge = isSurging && !state.isSurging
+  state.isSurging = isSurging
+
   let alert
-  if (state.step - state.lastAlertStep >= policy.cooldownSteps
-    && detectBudgetSurge(state.history, budget.remaining, budget.thresholdTokens, policy)) {
+  if (enteredSurge && state.step - state.lastAlertStep >= policy.cooldownSteps) {
     state.lastAlertStep = state.step
     state.activeUntilStep = state.step + policy.activeSteps - 1
 
@@ -424,6 +442,8 @@ export function advanceSurgeState(previous, budget, policy = DEFAULT_SURGE_POLIC
     const baseline = state.history[state.history.length - spanSteps]
     alert = {
       spanSteps,
+      spentTokens: baseline - budget.remaining,
+      remainingTokens: budget.remaining,
       spentRatio: (baseline - budget.remaining) / budget.thresholdTokens,
       remainingRatio: budget.remaining / budget.thresholdTokens,
     }
@@ -434,10 +454,19 @@ export function advanceSurgeState(previous, budget, policy = DEFAULT_SURGE_POLIC
   return { state, active: state.step <= state.activeUntilStep, alert }
 }
 
-/** A factual signal only: no imperative, task strategy, or prescribed action. */
-export function formatSurgeNotice({ spanSteps, spentRatio, remainingRatio }) {
+/** Historical, factual event: the representation matches context_remaining. */
+export function formatSurgeNotice(
+  { spanSteps, spentTokens, remainingTokens, spentRatio, remainingRatio },
+  representation = DEFAULT_BUDGET_REPRESENTATION,
+) {
   const steps = spanSteps === 1 ? 'step' : 'steps'
-  return `context_usage_notice: rapid consumption (${(spentRatio * 100).toFixed(1)}% of proactive-compaction budget over ${spanSteps} ${steps}); remaining ${(remainingRatio * 100).toFixed(1)}%.`
+  if (representation === 'raw') {
+    return `context_usage_notice: observed rapid consumption (${spentTokens} tokens over ${spanSteps} ${steps}); remaining ${remainingTokens} tokens at observation.`
+  }
+  if (representation === 'normalized') {
+    return `context_usage_notice: observed rapid consumption (${(spentRatio * 100).toFixed(1)}% of proactive-compaction budget over ${spanSteps} ${steps}); remaining ${(remainingRatio * 100).toFixed(1)}% at observation.`
+  }
+  throw new TypeError('dsh-budget-tracker: unsupported surge notice representation')
 }
 
 /** Build one immutable budget snapshot message without runtime dependencies. */
@@ -572,6 +601,7 @@ export function apply(ctx, config = {}) {
   const budgetRepresentation = resolveBudgetRepresentation(config)
   const adaptivePolicy = resolveAdaptivePolicyConfig(config)
   const surgePolicy = resolveSurgePolicyConfig(config)
+  const surgeNotice = resolveSurgeNoticeConfig(config)
   const adaptiveGuidanceByAgent = new WeakMap()
   const surgeStateByAgent = new WeakMap()
   const runtimeCapabilities = { admissionContextRefresh: undefined }
@@ -627,8 +657,9 @@ export function apply(ctx, config = {}) {
     if (budgetText !== undefined && retainedBudgetText(agent.session) !== budgetText) {
       messages.push(createBudgetMessage(budgetText))
     }
-    if (surge?.alert) {
-      messages.push(createSurgeNotice(formatSurgeNotice(surge.alert)))
+    if (surge?.alert && (surgeNotice === 'on'
+      || (surgeNotice === 'auto' && promptMode !== 'none'))) {
+      messages.push(createSurgeNotice(formatSurgeNotice(surge.alert, budgetRepresentation)))
     }
     if (messages.length === decision.messages.length) return decision
     return { ...decision, messages }
