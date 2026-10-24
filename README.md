@@ -2,6 +2,8 @@
 
 A deliberately tiny budget-awareness plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
 
+For maintainers and contributors, see [Project governance](docs/governance.md) for the project's architecture, ADR, and change-work conventions.
+
 It exposes exactly one model-visible budget field. The default representation remains the historical raw scalar:
 
 ```text
